@@ -40,18 +40,26 @@ const rulesets = require(`${ROOT}/packages/rulesets/dist/oas/index.js`);
 const spectral = new Spectral();
 spectral.setRuleset(rulesets.default?.default ?? rulesets.default);
 
-const results = await spectral.run(new Document(readFileSync(DOC, 'utf8'), Parsers.Yaml));
-const normalised = results
-  .map(
-    r =>
-      `${r.code}|${JSON.stringify(r.path)}|${r.severity}|` +
-      `${r.range.start.line}:${r.range.start.character}-${r.range.end.line}:${r.range.end.character}|${r.message}`,
-  )
-  .sort();
+// The source MUST be passed. With source === null, documentInventory.ts:111
+// returns null before the refMap reverse-resolution walk (lines 115-178) ever
+// runs, so a gate built on a source-less Document certifies a code path the CLI
+// never takes -- and that walk is exactly what the resolver patches touch.
+const results = await spectral.run(new Document(readFileSync(DOC, 'utf8'), Parsers.Yaml, DOC));
 
-console.log('findings:', results.length);
-console.log('sha256:  ', createHash('sha256').update(normalised.join('\n')).digest('hex'));
+const row = r =>
+  `${r.code}|${r.source ?? ''}|${JSON.stringify(r.path)}|${r.severity}|` +
+  `${r.range.start.line}:${r.range.start.character}-${r.range.end.line}:${r.range.end.character}|` +
+  `${r.documentationUrl ?? ''}|${r.message}`;
+
+const inOrder = results.map(row);
+const sorted = [...inOrder].sort();
+const h = a => createHash('sha256').update(a.join('\n')).digest('hex');
+
+console.log('findings:  ', results.length);
+// Ordering is user-visible output (prepareResults/sortResults), so hash it too.
+console.log('sha256(order):', h(inOrder));
+console.log('sha256(set):  ', h(sorted));
 if (OUT !== undefined) {
-  writeFileSync(OUT, normalised.join('\n'));
-  console.log('wrote:   ', OUT);
+  writeFileSync(OUT, inOrder.join('\n'));
+  console.log('wrote:     ', OUT);
 }
