@@ -5,7 +5,11 @@ import { prepareResults } from './utils/results';
 import { lintNode } from './lintNode';
 import { IRunnerInternalContext } from './types';
 import { Ruleset } from '../ruleset/ruleset';
-import Nimma, { Callback } from 'nimma/legacy'; // legacy = Node v12, nimma without /legacy supports only 14+
+// The `/legacy` build is Babel-downcompiled for Node 12; its lowered private
+// fields turn every traversal step into a pair of WeakMap lookups. This package
+// requires Node >= 16.20 (see `engines`), and nimma's modern build supports
+// >= 14.13, so the legacy build costs ~1.4x on the query phase for nothing.
+import Nimma, { Callback } from 'nimma';
 import { jsonPathPlus } from 'nimma/fallbacks';
 import { isPlainObject } from '@stoplight/json';
 
