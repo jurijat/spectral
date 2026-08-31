@@ -89,20 +89,20 @@ export default createRulesetFunction<
     const results: IFunctionResult[] = [];
     const messages = getAllMessages(targetVal);
 
-    const seenIds: unknown[] = [];
+    const seenIds = new Set<unknown>();
     for (const { path, message } of messages) {
       const maybeMessageId = retrieveMessageId(message);
       if (maybeMessageId === undefined) {
         continue;
       }
 
-      if (seenIds.includes(maybeMessageId.messageId)) {
+      if (seenIds.has(maybeMessageId.messageId)) {
         results.push({
           message: '"messageId" must be unique across all the messages.',
           path: [...path, ...maybeMessageId.path],
         });
       } else {
-        seenIds.push(maybeMessageId.messageId);
+        seenIds.add(maybeMessageId.messageId);
       }
     }
 

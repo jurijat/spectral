@@ -59,20 +59,20 @@ export default createRulesetFunction<
     const results: IFunctionResult[] = [];
     const operations = getAllOperations(targetVal);
 
-    const seenIds: unknown[] = [];
+    const seenIds = new Set<unknown>();
     for (const { path, operation } of operations) {
       const maybeOperationId = retrieveOperationId(operation);
       if (maybeOperationId === undefined) {
         continue;
       }
 
-      if (seenIds.includes(maybeOperationId.operationId)) {
+      if (seenIds.has(maybeOperationId.operationId)) {
         results.push({
           message: '"operationId" must be unique across all the operations.',
           path: [...path, ...maybeOperationId.path],
         });
       } else {
-        seenIds.push(maybeOperationId.operationId);
+        seenIds.add(maybeOperationId.operationId);
       }
     }
 

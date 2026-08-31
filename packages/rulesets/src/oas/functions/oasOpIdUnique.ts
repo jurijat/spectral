@@ -13,7 +13,7 @@ export default createRulesetFunction<Record<string, unknown>, null>(
   function oasOpIdUnique(paths) {
     const results: IFunctionResult[] = [];
 
-    const seenIds: unknown[] = [];
+    const seenIds = new Set<unknown>();
 
     for (const { path, operation } of getAllOperations(paths)) {
       const pathValue = paths[path];
@@ -28,13 +28,13 @@ export default createRulesetFunction<Record<string, unknown>, null>(
 
       const { operationId } = operationValue;
 
-      if (seenIds.includes(operationId)) {
+      if (seenIds.has(operationId)) {
         results.push({
           message: 'operationId must be unique.',
           path: ['paths', path, operation, 'operationId'],
         });
       } else {
-        seenIds.push(operationId);
+        seenIds.add(operationId);
       }
     }
 
