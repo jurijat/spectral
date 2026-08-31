@@ -111,6 +111,46 @@ the size of the data it describes and exists for a few thousand findings, and
 materialising the resolved graph costs both memory and ~2x on the `run` phase
 because rules then traverse the inlined duplicates.
 
+## Round 2: the result pipeline
+
+The corpus above produces **zero findings**, which makes it blind to everything
+downstream of a rule match. `gen-synthetic.mjs --dirty` strips descriptions and
+operationIds so the same document yields ~50k findings, and that exposed two more
+wins. Back-to-back A/B on a 21.3MB `--dirty` corpus, two passes:
+
+| config | run phase | total | peak RSS |
+|---|---|---|---|
+| after round 1 | 19,202 / 20,050 ms | 31,369 / 32,670 ms | 2,220 MB |
+| + AST key index | 5,811 / 5,709 ms | 18,198 / 17,684 ms | 2,222 MB |
+| + modern nimma build | **4,408 / 4,364 ms** | **16,637 / 16,580 ms** | 2,222 MB |
+
+**3.4x on the run phase, 1.93x overall**, output byte-identical, peak RSS unchanged.
+
+1. **`@stoplight/yaml` `findNodeAtPath`** rebuilt `getMappings()` and linear-scanned
+   it at every MAP node on every path, so range resolution was O(F x depth x fanout)
+   with a fresh array allocation per step. Replaced with a key->node `Map` cached in
+   a `WeakMap` on the AST node. Patched in `patches/@stoplight+yaml+4.3.0.patch`.
+   Map keys are the raw `item.key.value` so lookup stays SameValueZero, matching the
+   `===` the scan used -- stringifying would make `'200'` and `200` collide.
+2. **`nimma/legacy`** is Babel-downcompiled for Node 12; its lowered private fields
+   make every traversal step a pair of WeakMap lookups. spectral-core requires
+   Node >= 16.20 and nimma's modern build supports >= 14.13, so the legacy build
+   was pure cost. One-line import change.
+
+### Measured and rejected
+
+- **Selective key ordering.** `preserveKeyOrder: true` wraps every map in an
+  ordering Proxy, but JS already preserves insertion order for string keys -- only
+  integer-like keys (in OpenAPI: response status codes) are reordered. Wrapping only
+  the maps that need it preserves semantics exactly and cuts parse 2.9x... but makes
+  the run phase **worse** (12.8s -> 16.4s): the mixed plain/Proxy shapes turn
+  monomorphic property access in rule functions megamorphic. Uniformity beats
+  avoiding the Proxy. Do not do this.
+- **`preserveKeyOrder: false` outright** is 1.28x and -363MB RSS, and no bundled rule
+  depends on it (`alphabetical` is only used on `tags`, an array). But it changes the
+  iteration order of integer-like keys, which is observable through the public API
+  and by custom rulesets. It belongs behind a documented opt-in, not a silent flip.
+
 ## Caveats
 
 - The synthetic corpus is not your spec. Re-run against a real document before
