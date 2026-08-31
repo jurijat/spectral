@@ -1,0 +1,67 @@
+diff --git a/node_modules/@stoplight/yaml/getLocationForJsonPath.js b/node_modules/@stoplight/yaml/getLocationForJsonPath.js
+--- a/node_modules/@stoplight/yaml/getLocationForJsonPath.js
++++ b/node_modules/@stoplight/yaml/getLocationForJsonPath.js
+@@ -61,21 +61,15 @@ function findNodeAtPath(node, path, { closest, mergeKeys }) {
+             return closest ? node : void 0;
+         }
+         switch (node.kind) {
+-            case types_1.Kind.MAP:
+-                const mappings = getMappings(node.mappings, mergeKeys);
+-                for (let i = mappings.length - 1; i >= 0; i--) {
+-                    const item = mappings[i];
+-                    if (item.key.value === segment) {
+-                        if (item.value === null) {
+-                            node = item.key;
+-                        }
+-                        else {
+-                            node = item.value;
+-                        }
+-                        continue pathLoop;
+-                    }
++            case types_1.Kind.MAP: {
++                const index = getKeyIndex(node, mergeKeys);
++                const hit = index.get(segment);
++                if (hit !== undefined) {
++                    node = hit;
++                    continue pathLoop;
+                 }
+                 return closest ? node : void 0;
++            }
+             case types_1.Kind.SEQ:
+                 for (let i = 0; i < node.items.length; i++) {
+                     if (i === Number(segment)) {
+@@ -94,6 +88,34 @@ function findNodeAtPath(node, path, { closest, mergeKeys }) {
+     }
+     return node;
+ }
++// Range lookup walks this map once per path segment per finding. The original
++// rebuilt `getMappings()` and linear-scanned on every visit, making range
++// resolution O(F x depth x fanout) with an array allocation at each step. The
++// key->node map is identical work done once per node, then cached for the
++// lifetime of the AST node itself.
++//
++// Two caches because `mergeKeys` changes the mapping set. Map keys are the raw
++// `item.key.value`, so lookup is SameValueZero -- matching the `===` the linear
++// scan used; stringifying here would make '200' and 200 collide.
++const keyIndexCache = [new WeakMap(), new WeakMap()];
++function getKeyIndex(node, mergeKeys) {
++    const cache = keyIndexCache[mergeKeys ? 1 : 0];
++    const cached = cache.get(node);
++    if (cached !== undefined)
++        return cached;
++    const mappings = getMappings(node.mappings, mergeKeys);
++    const index = new Map();
++    // Forward insertion with overwrite reproduces the original reverse scan,
++    // which returned the last occurrence of a duplicated key.
++    for (let i = 0; i < mappings.length; i++) {
++        const item = mappings[i];
++        if (!utils_1.isObject(item) || !utils_1.isObject(item.key))
++            continue;
++        index.set(item.key.value, item.value === null ? item.key : item.value);
++    }
++    cache.set(node, index);
++    return index;
++}
+ function getMappings(mappings, mergeKeys) {
+     if (!mergeKeys)
+         return mappings;
