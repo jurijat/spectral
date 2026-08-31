@@ -44,3 +44,8 @@ packages/*/dist
 *.log*
 *-debug.log*
 *-error.log*
+
+# benchmark corpora (generate locally with scripts/bench)
+corpora/
+*.cpuprofile
+*.heapsnapshot
