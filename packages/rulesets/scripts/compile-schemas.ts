@@ -30,6 +30,45 @@ const log = process.argv.includes('--quiet')
     }
   : console.log.bind(console);
 
+/**
+ * `allErrors: true` makes ajv accumulate sub-schema errors with
+ *
+ *   acc = acc === null ? sub.errors : acc.concat(sub.errors)
+ *
+ * at every one of ~600 generated sites. `concat` copies the whole accumulator,
+ * so validating a document with E errors costs O(E^2) time and allocates O(E^2)
+ * array slots. Measured on OAS 3.0 with N operations carrying two unexpected
+ * properties each: 20k errors 207ms, 40k errors 994ms, 80k errors 3,509ms
+ * (fitted exponent 2.04), peaking at 137MB.
+ *
+ * Rewriting the accumulation to push in place makes it linear -- 107ms / 212ms /
+ * 423ms for the same inputs, peak 28MB -- and produces a byte-identical error
+ * array in the same order. `.slice()` on the seed preserves `concat`'s semantics
+ * of never aliasing ajv's own `errors` array.
+ */
+function deconcatenateErrorAccumulation(code: string): string {
+  // Whitespace-tolerant: terser emits this without spaces, other pipelines reformat it.
+  const pattern =
+    /([A-Za-z_$][\w$]*)\s*=\s*null\s*===\s*\1\s*\?\s*([A-Za-z_$][\w$]*)\.errors\s*:\s*\1\.concat\(\2\.errors\)/g;
+  let rewritten = 0;
+  const out = code.replace(pattern, (_match, acc: string, sub: string) => {
+    rewritten++;
+    return `(null === ${acc} ? ${acc} = ${sub}.errors.slice() : ${acc}.push.apply(${acc}, ${sub}.errors))`;
+  });
+
+  // If ajv or terser changes the emitted shape this silently stops applying and
+  // the quadratic comes back, so fail the build instead.
+  if (rewritten < 100) {
+    throw new Error(
+      `compile-schemas: expected to rewrite ajv's error accumulation at many sites, rewrote ${rewritten}. ` +
+        `The generated shape has changed -- update the pattern in deconcatenateErrorAccumulation().`,
+    );
+  }
+
+  log('rewrote %d ajv error-accumulation sites from concat to push', rewritten);
+  return out;
+}
+
 Promise.all(schemas)
   .then(async schemas => {
     const ajv = new Ajv2020({
@@ -73,6 +112,8 @@ Promise.all(schemas)
       })
     ).code as string;
 
+    const deconcatenated = deconcatenateErrorAccumulation(minified);
+
     log(
       'writing %s size is %dKB (original), %dKB (minified) %dKB (minified + gzipped)',
       path.join(target, '..', basename),
@@ -81,7 +122,7 @@ Promise.all(schemas)
       Math.round((sync(minified) / 1024) * 100) / 100,
     );
 
-    await fs.promises.writeFile(path.join(target, '..', basename), ['// @ts-nocheck', minified].join('\n'));
+    await fs.promises.writeFile(path.join(target, '..', basename), ['// @ts-nocheck', deconcatenated].join('\n'));
 
     log(
       'writing %s size is %dKB (original), %dKB (minified) %dKB (minified + gzipped)',
@@ -91,7 +132,7 @@ Promise.all(schemas)
       Math.round((sync(minified) / 1024) * 100) / 100,
     );
 
-    await fs.promises.writeFile(path.join(arazzoTarget, '..', basename), ['// @ts-nocheck', minified].join('\n'));
+    await fs.promises.writeFile(path.join(arazzoTarget, '..', basename), ['// @ts-nocheck', deconcatenated].join('\n'));
   })
   .then(() => {
     log(chalk.green('Validators generated.'));
