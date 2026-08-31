@@ -1,0 +1,20 @@
+diff --git a/node_modules/@stoplight/json-ref-resolver/runner.js b/node_modules/@stoplight/json-ref-resolver/runner.js
+--- a/node_modules/@stoplight/json-ref-resolver/runner.js
++++ b/node_modules/@stoplight/json-ref-resolver/runner.js
+@@ -307,12 +307,13 @@ class ResolveRunner {
+                                     continue;
+                                 const pointerPath = (0, json_1.pointerToPath)(pointer);
+                                 const val = pointerPath.length === 0 ? (0, immer_1.original)(draft) : get(draft, pointerPath);
++                                const dependantStems = crawler.pointerStemGraph.dependenciesOf(pointer);
++                                const stemPaths = dependantStems.map(function (s) { return (0, json_1.pointerToPath)(s); });
+                                 for (const dependant of dependants) {
+                                     let isCircular;
+                                     const dependantPath = (0, json_1.pointerToPath)(dependant);
+-                                    const dependantStems = crawler.pointerStemGraph.dependenciesOf(pointer);
+-                                    for (const stem of dependantStems) {
+-                                        if ((0, json_1.startsWith)(dependantPath, (0, json_1.pointerToPath)(stem))) {
++                                    for (const stem of stemPaths) {
++                                        if ((0, json_1.startsWith)(dependantPath, stem)) {
+                                             isCircular = true;
+                                             break;
+                                         }

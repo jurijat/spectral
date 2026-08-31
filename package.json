@@ -42,6 +42,7 @@
     "test.jest": "jest --silent --cacheDirectory=.cache/.jest",
     "test.karma": "karma start",
     "prepare": "husky install && yarn workspaces foreach run prepare",
+    "postinstall": "patch-package",
     "prerelease": "patch-package",
     "release": "yarn prerelease && multi-semantic-release --deps.bump=satisfy",
     "jest": "jest"

@@ -1,0 +1,30 @@
+diff --git a/node_modules/dependency-graph/lib/dep_graph.js b/node_modules/dependency-graph/lib/dep_graph.js
+--- a/node_modules/dependency-graph/lib/dep_graph.js
++++ b/node_modules/dependency-graph/lib/dep_graph.js
+@@ -151,10 +151,11 @@ DepGraph.prototype = {
+     if (!this.hasNode(to)) {
+       throw new Error("Node does not exist: " + to);
+     }
+-    if (this.outgoingEdges[from].indexOf(to) === -1) {
++    this._oidx = this._oidx || Object.create(null);
++    var ok = from + "\u0000" + to;
++    if (this._oidx[ok] === undefined) {
++      this._oidx[ok] = 1;
+       this.outgoingEdges[from].push(to);
+-    }
+-    if (this.incomingEdges[to].indexOf(from) === -1) {
+       this.incomingEdges[to].push(from);
+     }
+     return true;
+@@ -313,9 +314,10 @@ DepGraph.prototype = {
+       // nodes that did not end up in the initial result (as they are part of a
+       // subgraph that does not have a clear starting point)
+       if (this.circular) {
++        var _seen = new Set(result);
+         keys
+           .filter(function (node) {
+-            return result.indexOf(node) === -1;
++            return !_seen.has(node);
+           })
+           .forEach(function (n) {
+             DFS(n);
