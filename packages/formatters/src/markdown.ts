@@ -35,8 +35,15 @@ export const markdown: Formatter = (results, _options, ctx?: FormatterContext) =
 };
 
 function createMdTable(headers: string[], lines: string[][]): string {
-  //find lenght of each column
-  const columnLengths = headers.map((_, i) => Math.max(...lines.map(line => line[i].length), headers[i].length));
+  // Find the width of each column. Not Math.max(...lines.map(...)): spreading a
+  // row per finding throws RangeError above ~125k rows.
+  const columnLengths = headers.map((header, i) => {
+    let width = header.length;
+    for (const line of lines) {
+      if (line[i].length > width) width = line[i].length;
+    }
+    return width;
+  });
 
   let string = '';
   //create markdown table header
@@ -58,9 +65,12 @@ function createMdTable(headers: string[], lines: string[][]): string {
   //create markdown table rows
   for (const line of lines) {
     string += '\n|';
-    for (const cell of line) {
+    // indexOf(cell) returns the FIRST matching cell, so a row containing two
+    // equal values padded every occurrence to the first one's column width.
+    for (let i = 0; i < line.length; i++) {
+      const cell = line[i];
       string += ` ${cell}`;
-      string += ' '.repeat(columnLengths[line.indexOf(cell)] - cell.length);
+      string += ' '.repeat(columnLengths[i] - cell.length);
       string += ' |';
     }
   }
