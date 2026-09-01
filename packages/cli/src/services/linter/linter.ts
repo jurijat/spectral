@@ -51,11 +51,13 @@ export async function lint(documents: Array<number | string>, flags: ILintConfig
 
     const document = await createDocument(targetUri, { encoding: flags.encoding }, flags.stdinFilepath ?? '<STDIN>');
 
-    results.push(
-      ...(await spectral.run(document, {
-        ignoreUnknownFormat: flags.ignoreUnknownFormat,
-      })),
-    );
+    // Not results.push(...run()): a single document yielding more than ~123k
+    // findings throws RangeError here, before any formatter is even chosen.
+    for (const result of await spectral.run(document, {
+      ignoreUnknownFormat: flags.ignoreUnknownFormat,
+    })) {
+      results.push(result);
+    }
   }
 
   return {
