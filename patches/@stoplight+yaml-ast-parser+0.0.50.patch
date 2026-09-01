@@ -1,0 +1,80 @@
+diff --git a/node_modules/@stoplight/yaml-ast-parser/dist/src/yamlAST.js b/node_modules/@stoplight/yaml-ast-parser/dist/src/yamlAST.js
+--- a/node_modules/@stoplight/yaml-ast-parser/dist/src/yamlAST.js
++++ b/node_modules/@stoplight/yaml-ast-parser/dist/src/yamlAST.js
+@@ -17,15 +17,13 @@ function newMapping(key, value) {
+         startPosition: key.startPosition,
+         endPosition: end,
+         kind: Kind.MAPPING,
+-        parent: null,
+-        errors: []
++        parent: null
+     };
+     return node;
+ }
+ exports.newMapping = newMapping;
+ function newAnchorRef(key, start, end, value) {
+     return {
+-        errors: [],
+         referencesAnchor: key,
+         value: value,
+         startPosition: start,
+@@ -37,14 +35,14 @@ function newAnchorRef(key, start, end, value) {
+ exports.newAnchorRef = newAnchorRef;
+ function newScalar(v = "") {
+     const result = {
+-        errors: [],
+         startPosition: -1,
+         endPosition: -1,
+         value: "" + v,
+         kind: Kind.SCALAR,
+         parent: null,
+         doubleQuoted: false,
+-        rawValue: "" + v,
++        plainScalar: false,
++        singleQuoted: false,
+     };
+     if (typeof v !== "string") {
+         result.valueObject = v;
+@@ -54,7 +52,6 @@ function newScalar(v = "") {
+ exports.newScalar = newScalar;
+ function newItems() {
+     return {
+-        errors: [],
+         startPosition: -1,
+         endPosition: -1,
+         items: [],
+@@ -69,7 +66,6 @@ function newSeq() {
+ exports.newSeq = newSeq;
+ function newMap(mappings) {
+     return {
+-        errors: [],
+         startPosition: -1,
+         endPosition: -1,
+         mappings: mappings ? mappings : [],
+diff --git a/node_modules/@stoplight/yaml-ast-parser/dist/src/loader.js b/node_modules/@stoplight/yaml-ast-parser/dist/src/loader.js
+--- a/node_modules/@stoplight/yaml-ast-parser/dist/src/loader.js
++++ b/node_modules/@stoplight/yaml-ast-parser/dist/src/loader.js
+@@ -484,7 +484,6 @@ function readPlainScalar(state, nodeIndent, withinFlowCollection) {
+     }
+     captureSegment(state, captureStart, captureEnd, false);
+     if (state.result.startPosition != -1) {
+-        state_result.rawValue = state.input.substring(state_result.startPosition, state_result.endPosition);
+         return true;
+     }
+     state.kind = _kind;
+@@ -551,7 +550,6 @@ function readDoubleQuotedScalar(state, nodeIndent) {
+             captureSegment(state, captureStart, state.position, true);
+             state.position++;
+             scalar.endPosition = state.position;
+-            scalar.rawValue = state.input.substring(scalar.startPosition, scalar.endPosition);
+             return true;
+         }
+         else if (0x5C === ch) {
+@@ -815,7 +813,6 @@ function readBlockScalar(state, nodeIndent) {
+         i--;
+     }
+     sc.endPosition = i;
+-    sc.rawValue = state.input.substring(sc.startPosition, sc.endPosition);
+     return true;
+ }
+ function readBlockSequence(state, nodeIndent) {
