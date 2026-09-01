@@ -180,7 +180,16 @@ if (isMainThread) {
     const workers = [];
     const ready = [];
     for (let i = 0; i < concurrency; i++) {
-      const w = new Worker(fileURLToPath(import.meta.url), { workerData: { root: ROOT } });
+      // Without an explicit limit a worker gets a default old-space far below what
+      // a multi-MB lint needs, and dies with ERR_WORKER_OUT_OF_MEMORY. Give each
+      // worker an equal share of the budget instead.
+      const w = new Worker(fileURLToPath(import.meta.url), {
+        workerData: { root: ROOT },
+        resourceLimits: { maxOldGenerationSizeMb: Math.max(512, Math.floor((BUDGET_GB * 1024) / concurrency)) },
+      });
+      w.on('error', e => {
+        process.stderr.write(`\n  worker error: ${e.message.slice(0, 120)}\n`);
+      });
       workers.push(w);
       ready.push(new Promise(res => w.once('message', m => (m.type === 'ready' ? res() : null))));
     }
