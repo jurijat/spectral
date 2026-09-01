@@ -217,6 +217,10 @@ function relaxRequired(
     }));
 }
 
+// Keyed on the source schema object, which is a stable node of the (resolved)
+// document, so this is bounded by the document and dies with it.
+const preparedSchemas = new WeakMap<object, Map<string, SchemaOptions['schema']>>();
+
 export default createRulesetFunction<Record<string, unknown>, Options>(
   {
     input: {
@@ -251,21 +255,47 @@ export default createRulesetFunction<Record<string, unknown>, Options>(
         ? getSchemaValidationItems(SCHEMA_VALIDATION_ITEMS[opts.oasVersion], targetVal, context.path)
         : getMediaValidationItems(MEDIA_VALIDATION_ITEMS[opts.oasVersion], targetVal, context.path, opts.oasVersion);
 
-    if (formats?.has(oas2) && 'required' in schemaOpts.schema && typeof schemaOpts.schema.required === 'boolean') {
-      schemaOpts.schema = { ...schemaOpts.schema };
-      delete schemaOpts.schema.required;
+    const isRequest = opts.type === 'media' && isMediaRequest(context.path, opts.oasVersion);
+    const isResponse = opts.type === 'media' && isMediaResponse(context.path, opts.oasVersion);
+    const stripRequired =
+      formats?.has(oas2) === true &&
+      'required' in schemaOpts.schema &&
+      typeof schemaOpts.schema.required === 'boolean';
+
+    // The cloned+cleaned+relaxed schema is a pure function of the source schema
+    // object and these three flags, but it used to be rebuilt on every call --
+    // and because `prepareResults`' validator cache (packages/functions/src/schema/ajv.ts)
+    // is a WeakMap keyed on schema IDENTITY, a fresh clone guaranteed a miss and
+    // ajv recompiled the validator every time. On github.com@1.1.4 (8.4MB) that
+    // was 122,324 compilations for 634 findings; ajv's own `_cache` is a strong
+    // Map, so every one of them was also retained. Caching the processed schema
+    // on the source object makes both caches hit.
+    const variant = `${opts.oasVersion}|${stripRequired ? 1 : 0}|${isRequest ? 1 : 0}|${isResponse ? 1 : 0}`;
+    const source = schemaOpts.schema;
+    let byVariant = preparedSchemas.get(source);
+    if (byVariant === void 0) {
+      byVariant = new Map();
+      preparedSchemas.set(source, byVariant);
     }
 
-    // Make a deep copy of the schema and then remove all objects containing id or $id and that are not schema objects.
-    // This is to avoid problems down in "ajv" which does the actual schema validation.
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
-    schemaOpts.schema = JSON.parse(JSON.stringify(schemaOpts.schema));
-    cleanSchema(schemaOpts.schema);
-    relaxRequired(
-      schemaOpts.schema,
-      opts.type === 'media' && isMediaRequest(context.path, opts.oasVersion),
-      opts.type === 'media' && isMediaResponse(context.path, opts.oasVersion),
-    );
+    let prepared = byVariant.get(variant);
+    if (prepared === void 0) {
+      let base = source;
+      if (stripRequired) {
+        base = { ...base };
+        delete base.required;
+      }
+
+      // Make a deep copy of the schema and then remove all objects containing id or $id and that are not schema objects.
+      // This is to avoid problems down in "ajv" which does the actual schema validation.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      prepared = JSON.parse(JSON.stringify(base)) as SchemaOptions['schema'];
+      cleanSchema(prepared);
+      relaxRequired(prepared, isRequest, isResponse);
+      byVariant.set(variant, prepared);
+    }
+
+    schemaOpts.schema = prepared;
 
     for (const validationItem of validationItems) {
       const result = oasSchema(validationItem.value, schemaOpts, {
