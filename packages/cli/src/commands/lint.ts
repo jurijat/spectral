@@ -208,17 +208,22 @@ const lintCommand: CommandModule = {
         linterResult.results = removeDocumentationUrlFromResults(linterResult.results);
       }
 
-      await Promise.all(
-        format.map(f => {
-          const formattedOutput = formatOutput(
-            linterResult.results,
-            f,
-            { failSeverity: getDiagnosticSeverity(failSeverity) },
-            linterResult.resolvedRuleset,
-          );
-          return writeOutput(formattedOutput, output?.[f] ?? '<stdout>');
-        }),
-      );
+      // Format everything before writing anything. Previously formatOutput ran
+      // inside the map callback, so a synchronous throw from one formatter
+      // escaped before Promise.all while a sibling's writeOutput had already
+      // truncated its target -- leaving a 0-byte file where the previous good
+      // output used to be.
+      const formatted: [output: string, target: string][] = format.map(f => [
+        formatOutput(
+          linterResult.results,
+          f,
+          { failSeverity: getDiagnosticSeverity(failSeverity) },
+          linterResult.resolvedRuleset,
+        ),
+        output?.[f] ?? '<stdout>',
+      ]);
+
+      await Promise.all(formatted.map(([formattedOutput, target]) => writeOutput(formattedOutput, target)));
 
       if (linterResult.results.length > 0) {
         process.exit(severeEnoughToFail(linterResult.results, failSeverity) ? 1 : 0);
