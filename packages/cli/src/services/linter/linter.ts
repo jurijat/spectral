@@ -51,12 +51,19 @@ export async function lint(documents: Array<number | string>, flags: ILintConfig
 
     const document = await createDocument(targetUri, { encoding: flags.encoding }, flags.stdinFilepath ?? '<STDIN>');
 
-    // Not results.push(...run()): a single document yielding more than ~123k
-    // findings throws RangeError here, before any formatter is even chosen.
-    for (const result of await spectral.run(document, {
-      ignoreUnknownFormat: flags.ignoreUnknownFormat,
-    })) {
-      results.push(result);
+    try {
+      // Not results.push(...run()): a single document yielding more than ~123k
+      // findings throws RangeError here, before any formatter is even chosen.
+      for (const result of await spectral.run(document, {
+        ignoreUnknownFormat: flags.ignoreUnknownFormat,
+      })) {
+        results.push(result);
+      }
+    } finally {
+      // The CLI consumes only diagnostics, not the resolved document. Keeping the
+      // resolver cache across input files pins every parsed root (and its remotes)
+      // until process exit, so use an explicit per-document cache lifetime.
+      spectral.clearCache();
     }
   }
 

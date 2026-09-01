@@ -26,6 +26,18 @@ export interface IDocumentInventory {
 export class DocumentInventory implements IDocumentInventory {
   private static readonly _cachedRemoteDocuments = new WeakMap<Resolver['uriCache'], Dictionary<IDocument>>();
 
+  /**
+   * Releases every document retained for a resolver. A Resolver deliberately
+   * caches across resolve calls, which is useful within one lint but otherwise
+   * makes a long-lived Spectral instance retain every root and remote document it
+   * has seen. Call this only when no run using the resolver is still in flight.
+   */
+  public static clearCache(resolver: Resolver): void {
+    const cache = resolver.uriCache;
+    DocumentInventory._cachedRemoteDocuments.delete(cache);
+    cache.purge();
+  }
+
   public graph: ResolveResult['graph'] | null;
   public resolved: unknown;
   public errors: IRuleResult[] | null;

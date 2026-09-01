@@ -4,7 +4,7 @@ import { join, resolve } from '@stoplight/path';
 import nock from 'nock';
 import * as yargs from 'yargs';
 import { DiagnosticSeverity } from '@stoplight/types';
-import { RulesetValidationError } from '@stoplight/spectral-core';
+import { RulesetValidationError, Spectral } from '@stoplight/spectral-core';
 import '@stoplight/spectral-test-utils/matchers';
 import AggregateError = require('es-aggregate-error');
 import * as process from 'process';
@@ -150,6 +150,50 @@ describe('Linter service', () => {
         source: documents[1],
       },
     ]);
+  });
+
+  it('clears the resolver cache after each input document', async () => {
+    const clearCache = jest.spyOn(Spectral.prototype, 'clearCache');
+    const documents = [
+      join(__dirname, `./__fixtures__/invalid-stoplight-info-document.json`),
+      join(__dirname, `./__fixtures__/missing-stoplight-info-document.json`),
+    ];
+
+    try {
+      await lint(documents, {
+        encoding: 'utf8',
+        failOnUnmatchedGlobs: false,
+        format: [],
+        ignoreUnknownFormat: true,
+        ruleset: join(__dirname, './__fixtures__/spectral.js'),
+        showDocumentationUrl: false,
+      });
+      expect(clearCache).toHaveBeenCalledTimes(documents.length);
+    } finally {
+      clearCache.mockRestore();
+    }
+  });
+
+  it('clears the resolver cache when linting a document fails', async () => {
+    const runDocument = jest.spyOn(Spectral.prototype, 'run').mockRejectedValueOnce(new Error('lint failed'));
+    const clearCache = jest.spyOn(Spectral.prototype, 'clearCache');
+
+    try {
+      await expect(
+        lint([join(__dirname, `./__fixtures__/invalid-stoplight-info-document.json`)], {
+          encoding: 'utf8',
+          failOnUnmatchedGlobs: false,
+          format: [],
+          ignoreUnknownFormat: true,
+          ruleset: join(__dirname, './__fixtures__/spectral.js'),
+          showDocumentationUrl: false,
+        }),
+      ).rejects.toThrow('lint failed');
+      expect(clearCache).toHaveBeenCalledTimes(1);
+    } finally {
+      runDocument.mockRestore();
+      clearCache.mockRestore();
+    }
   });
 
   it('sorts linting results in an alphabetical order', () => {

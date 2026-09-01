@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import nock from 'nock';
 import * as path from '@stoplight/path';
 import * as Parsers from '@stoplight/spectral-parsers';
-import { httpAndFileResolver } from '@stoplight/spectral-ref-resolver';
+import { createHttpAndFileResolver, httpAndFileResolver } from '@stoplight/spectral-ref-resolver';
 
 import { Document } from '../document';
 import { Spectral } from '../spectral';
@@ -86,6 +86,42 @@ describe('Spectral', () => {
         source: expect.stringContaining('__fixtures__/models/todo-full.v1.json'),
       },
     ]);
+  });
+
+  test('clearCache refreshes external references for every instance sharing the resolver', async () => {
+    const resolver = createHttpAndFileResolver();
+    const first = new Spectral({ resolver });
+    const second = new Spectral({ resolver });
+    const ruleset = {
+      rules: {
+        'remote-marker': {
+          given: '$.external',
+          then: {
+            field: 'marker',
+            function: truthy,
+          },
+        },
+      },
+    };
+    first.setRuleset(ruleset);
+    second.setRuleset(ruleset);
+
+    const source = JSON.stringify({ external: { $ref: 'http://cache.test/remote.json' } });
+    const initial = nock('http://cache.test').get('/remote.json').reply(200, { marker: true });
+    await expect(first.run(new Document(source, Parsers.Json, 'first.json'))).resolves.toEqual([]);
+    expect(initial.isDone()).toBe(true);
+
+    first.clearCache();
+
+    const refreshed = nock('http://cache.test').get('/remote.json').reply(200, { marker: false });
+    await expect(second.run(new Document(source, Parsers.Json, 'second.json'))).resolves.toEqual([
+      expect.objectContaining({
+        code: 'remote-marker',
+        path: ['marker'],
+        source: 'http://cache.test/remote.json',
+      }),
+    ]);
+    expect(refreshed.isDone()).toBe(true);
   });
 
   test('properly decorates results with metadata pertaining to the document being linted', async () => {

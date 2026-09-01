@@ -11,6 +11,11 @@ export type Options = {
   type: 'media' | 'schema';
 };
 
+const schemaCompilationMode: unique symbol = Symbol.for('@stoplight/spectral-functions/schemaCompilationMode');
+type InternalSchemaOptions = SchemaOptions & {
+  [schemaCompilationMode]: 0;
+};
+
 type HasRequiredProperties = traverse.SchemaObject & {
   required?: string[];
 };
@@ -147,39 +152,101 @@ function* getSchemaValidationItems(
   }
 }
 
-const KNOWN_TRAVERSE_KEYWORDS = [
-  /* eslint-disable @typescript-eslint/no-unsafe-argument */
-  ...Object.keys(traverse['keywords']),
-  ...Object.keys(traverse['arrayKeywords']),
-  ...Object.keys(traverse['propsKeywords']),
-  /* eslint-enable @typescript-eslint/no-unsafe-argument */
-];
+const SCHEMA_VALUE_KEYWORDS = new Set([
+  'additionalItems',
+  'additionalProperties',
+  'contains',
+  'contentSchema',
+  'else',
+  'if',
+  'not',
+  'propertyNames',
+  'then',
+  'unevaluatedItems',
+  'unevaluatedProperties',
+]);
+const SCHEMA_ARRAY_KEYWORDS = new Set(['allOf', 'anyOf', 'items', 'oneOf', 'prefixItems']);
+const SCHEMA_MAP_KEYWORDS = new Set([
+  '$defs',
+  'definitions',
+  'dependencies',
+  'dependentSchemas',
+  'patternProperties',
+  'properties',
+]);
+const SCHEMA_DATA_KEYWORDS = new Set([
+  'const',
+  'default',
+  'dependentRequired',
+  'enum',
+  'exclusiveMaximum',
+  'exclusiveMinimum',
+  'format',
+  'maximum',
+  'maxItems',
+  'maxLength',
+  'maxProperties',
+  'minimum',
+  'minItems',
+  'minLength',
+  'minProperties',
+  'multipleOf',
+  'pattern',
+  'required',
+  'uniqueItems',
+]);
 
 /**
- * Modifies 'schema' (and all its sub-schemas) to remove all id fields from non-schema objects
+ * Modifies 'schema' (and all its sub-schemas) to remove id fields from non-schema objects
  * In this context, "sub-schemas" refers to all schemas reachable from 'schema'
  * (e.g. properties, additionalProperties, allOf/anyOf/oneOf, not, items, etc.)
  * @param schema the schema to be sanitized
  * @returns 'schema' with id fields removed
  */
 function cleanSchema(schema: Record<string, unknown>): void {
-  traverse(schema, { allKeys: true }, <traverse.Callback>((
-    fragment,
-    jsonPtr,
-    rootSchema,
-    parentJsonPtr,
-    parentKeyword,
-  ) => {
-    if (parentKeyword === void 0 || KNOWN_TRAVERSE_KEYWORDS.includes(parentKeyword)) return;
+  visitObject(schema, true);
 
-    if ('id' in fragment) {
+  function visitObject(fragment: Record<string, unknown>, schemaPosition: boolean): void {
+    if (!schemaPosition) {
       delete fragment.id;
+      delete fragment.$id;
     }
 
-    if ('$id' in fragment) {
-      delete fragment.id;
+    for (const [keyword, value] of Object.entries(fragment)) {
+      if (SCHEMA_DATA_KEYWORDS.has(keyword)) continue;
+
+      if (SCHEMA_ARRAY_KEYWORDS.has(keyword)) {
+        if (Array.isArray(value)) {
+          for (const item of value) visitSchemaValue(item);
+        } else {
+          visitSchemaValue(value);
+        }
+
+        continue;
+      }
+
+      if (SCHEMA_MAP_KEYWORDS.has(keyword)) {
+        if (isObject(value) && !Array.isArray(value)) {
+          for (const nestedSchema of Object.values(value)) visitSchemaValue(nestedSchema);
+        }
+
+        continue;
+      }
+
+      if (SCHEMA_VALUE_KEYWORDS.has(keyword)) {
+        visitSchemaValue(value);
+        continue;
+      }
+
+      if (isObject(value) && !Array.isArray(value)) {
+        visitObject(value, false);
+      }
     }
-  }));
+  }
+
+  function visitSchemaValue(value: unknown): void {
+    if (isObject(value) && !Array.isArray(value)) visitObject(value, true);
+  }
 }
 
 /**
@@ -244,7 +311,8 @@ export default createRulesetFunction<Record<string, unknown>, Options>(
   },
   function oasExample(targetVal, opts, context) {
     const formats = context.document.formats;
-    const schemaOpts: SchemaOptions = {
+    const schemaOpts: InternalSchemaOptions = {
+      [schemaCompilationMode]: 0,
       schema: opts.schemaField === '$' ? targetVal : (targetVal[opts.schemaField] as SchemaOptions['schema']),
     };
 
@@ -258,9 +326,7 @@ export default createRulesetFunction<Record<string, unknown>, Options>(
     const isRequest = opts.type === 'media' && isMediaRequest(context.path, opts.oasVersion);
     const isResponse = opts.type === 'media' && isMediaResponse(context.path, opts.oasVersion);
     const stripRequired =
-      formats?.has(oas2) === true &&
-      'required' in schemaOpts.schema &&
-      typeof schemaOpts.schema.required === 'boolean';
+      formats?.has(oas2) === true && 'required' in schemaOpts.schema && typeof schemaOpts.schema.required === 'boolean';
 
     // The cloned+cleaned+relaxed schema is a pure function of the source schema
     // object and these three flags, but it used to be rebuilt on every call --
@@ -288,7 +354,6 @@ export default createRulesetFunction<Record<string, unknown>, Options>(
 
       // Make a deep copy of the schema and then remove all objects containing id or $id and that are not schema objects.
       // This is to avoid problems down in "ajv" which does the actual schema validation.
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
       prepared = JSON.parse(JSON.stringify(base)) as SchemaOptions['schema'];
       cleanSchema(prepared);
       relaxRequired(prepared, isRequest, isResponse);

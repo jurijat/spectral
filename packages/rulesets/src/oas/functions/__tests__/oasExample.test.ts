@@ -1,4 +1,4 @@
-import { oas3, oas3_0 } from '@stoplight/spectral-formats';
+import { oas3, oas3_0, oas3_1 } from '@stoplight/spectral-formats';
 import { DeepPartial } from '@stoplight/types';
 import oasExample, { Options as ExampleOptions } from '../oasExample';
 import { RulesetFunctionContext } from '@stoplight/spectral-core/src';
@@ -16,19 +16,26 @@ const mediaOpts: ExampleOptions = {
 const docFormats = {
   formats: new Set([oas3, oas3_0]),
 };
+const docFormats31 = {
+  formats: new Set([oas3, oas3_1]),
+};
 
 /**
  * Runs the oasExample() custom rule function to perform a single test.
  * @param target the object (media type or schema) containing an example/default value
  * @param ruleOptions the options to be passed to oasExample()
- * @param context the spectral context object to pass to oasExample()
+ * @param document the document context to pass to oasExample()
  * @returns an array of errors, or [] if no errors occurred
  */
-function runRule(testData: Record<string, unknown>, ruleOptions: ExampleOptions) {
+function runRule(
+  testData: Record<string, unknown>,
+  ruleOptions: ExampleOptions,
+  document: DeepPartial<RulesetFunctionContext['document']> = docFormats,
+) {
   const context: DeepPartial<RulesetFunctionContext> = {
     path: [],
     documentInventory: {},
-    document: docFormats,
+    document,
   };
 
   return oasExample(testData, ruleOptions, context as RulesetFunctionContext);
@@ -78,6 +85,26 @@ describe('oasExample', () => {
 
         const results = runRule(schema, schemaOpts);
         expect(results).toHaveLength(0);
+      });
+      test('repeated $id fields in example annotations are not treated as schema identifiers', () => {
+        const schema = {
+          type: 'string',
+          allOf: [
+            {
+              example: {
+                $id: 'urn:spectral:test:example-id',
+              },
+            },
+            {
+              example: {
+                $id: 'urn:spectral:test:example-id',
+              },
+            },
+          ],
+          example: 'valid',
+        };
+
+        expect(runRule(schema, schemaOpts)).toHaveLength(0);
       });
       test('scenario: "resolves to more than one schema"', () => {
         // This test data is from https://github.com/stoplightio/spectral/issues/2081 and
@@ -326,11 +353,12 @@ describe('oasExample', () => {
           },
         };
 
-        const results = runRule(schema, schemaOpts);
-        expect(results).toHaveLength(1);
-
-        expect(results[0].path.join('.')).toBe('example.bar');
-        expect(results[0].message).toBe(`"bar" property type must be string`);
+        expect(runRule(schema, schemaOpts)).toStrictEqual([
+          {
+            message: `"bar" property type must be string`,
+            path: ['example', 'bar'],
+          },
+        ]);
       });
       test('invalid "default" string', () => {
         const schema = {
@@ -345,6 +373,26 @@ describe('oasExample', () => {
         expect(results).toHaveLength(1);
         expect(results[0].message).toBe(`"default" property must not have more than 8 characters`);
         expect(results[0].path.join('.')).toBe('default');
+      });
+      test('preserves dependentSchemas entries named id in OAS 3.1', () => {
+        const schema = {
+          type: 'object',
+          dependentSchemas: {
+            id: {
+              required: ['name'],
+            },
+          },
+          example: {
+            id: '1',
+          },
+        };
+
+        expect(runRule(schema, schemaOpts, docFormats31)).toStrictEqual([
+          {
+            message: `"example" property must have required property "name"`,
+            path: ['example'],
+          },
+        ]);
       });
     });
     describe('example/examples value in mediatype', () => {

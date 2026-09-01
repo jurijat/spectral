@@ -8,11 +8,16 @@ import { isError } from 'lodash';
 
 import { optionSchemas } from '../optionSchemas';
 
+const schemaCompilationMode: unique symbol = Symbol.for('@stoplight/spectral-functions/schemaCompilationMode');
+
 export type Options = {
   schema: Record<string, unknown> | JSONSchema;
   allErrors?: boolean;
   dialect?: 'auto' | 'draft4' | 'draft6' | 'draft7' | 'draft2019-09' | 'draft2020-12';
   prepareResults?(errors: ErrorObject[]): void;
+};
+type InternalOptions = Options & {
+  [schemaCompilationMode]?: 0;
 };
 
 const instances = new WeakMap<RulesetFunctionContext['documentInventory'], ReturnType<typeof createAjvInstances>>();
@@ -32,9 +37,11 @@ export default createRulesetFunction<unknown, Options>(
       ];
     }
 
-    const assignAjvInstance =
-      instances.get(documentInventory) ??
-      instances.set(documentInventory, createAjvInstances()).get(documentInventory)!;
+    let assignAjvInstance = instances.get(documentInventory);
+    if (assignAjvInstance === void 0) {
+      assignAjvInstance = createAjvInstances();
+      instances.set(documentInventory, assignAjvInstance);
+    }
 
     const results: IFunctionResult[] = [];
 
@@ -45,7 +52,12 @@ export default createRulesetFunction<unknown, Options>(
       const dialect =
         (opts.dialect === void 0 || opts.dialect === 'auto' ? detectDialect(schemaObj) : opts?.dialect) ?? 'draft7';
 
-      const validator = assignAjvInstance(schemaObj, dialect, allErrors);
+      const validator = assignAjvInstance(
+        schemaObj,
+        dialect,
+        allErrors,
+        (opts as InternalOptions)[schemaCompilationMode],
+      );
 
       if (validator?.(targetVal) === false && Array.isArray(validator.errors)) {
         opts.prepareResults?.(validator.errors);

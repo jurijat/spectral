@@ -72,12 +72,14 @@
  * prefixed with `##SWEEP##` on stdout so that any noise the linter writes to
  * stdout/stderr cannot corrupt the result.
  */
-import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { resolve as pathResolve, dirname, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
+import { assertExecutableProvenanceUnchanged, collectProvenance, sha256 } from './provenance.mjs';
+import { prepareRunner, rulesetForDocument } from './spectral-run-parity.mjs';
 
 const require = createRequire(import.meta.url);
 const SELF = fileURLToPath(import.meta.url);
@@ -85,7 +87,10 @@ const ROOT = pathResolve(dirname(SELF), '../..');
 const MARKER = '##SWEEP##';
 
 const argv = process.argv.slice(2);
-const arg = (n, d) => { const i = argv.indexOf(`--${n}`); return i === -1 ? d : argv[i + 1]; };
+const arg = (n, d) => {
+  const i = argv.indexOf(`--${n}`);
+  return i === -1 ? d : argv[i + 1];
+};
 const args = n => argv.reduce((a, v, i) => (v === `--${n}` ? [...a, argv[i + 1]] : a), []);
 const flag = n => argv.includes(`--${n}`);
 const MB = b => +(b / 1048576).toFixed(1);
@@ -104,13 +109,22 @@ function loadCore() {
   };
 }
 
-const emit = obj => process.stdout.write(`\n${MARKER}${JSON.stringify(obj)}\n`);
+const emit = obj =>
+  new Promise((resolve, reject) => {
+    process.stdout.write(`\n${MARKER}${JSON.stringify(obj)}\n`, error => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
 
 /** Pass A: the timed lint. */
 async function workerLint() {
   const DOC = arg('doc');
   const RULESET_NAME = arg('ruleset', 'oas');
   const REPEAT = Number(arg('repeat', '1'));
+  if (!['oas', 'asyncapi', 'arazzo'].includes(RULESET_NAME)) {
+    throw new Error(`unknown ruleset "${RULESET_NAME}"`);
+  }
 
   // --- hook 1: ajv compile counter. ajv/dist/ajv.js does `class Ajv extends
   // core_1.default` and never overrides compile(), so patching the core
@@ -122,8 +136,13 @@ async function workerLint() {
     const ajvCore = require(`${ROOT}/node_modules/ajv/dist/core.js`);
     const proto = (ajvCore.default ?? ajvCore).prototype;
     const orig = proto.compile;
-    proto.compile = function (...a) { ajvCompiles++; return orig.apply(this, a); };
-  } catch (e) { /* counted as -1 below */ ajvCompiles = -1; }
+    proto.compile = function (...a) {
+      ajvCompiles++;
+      return orig.apply(this, a);
+    };
+  } catch (e) {
+    /* counted as -1 below */ ajvCompiles = -1;
+  }
 
   // --- hook 2: oasExample invocation counter. The ruleset object literal in
   // packages/rulesets/dist/oas/index.js captures functions_1.oasExample at
@@ -138,27 +157,40 @@ async function workerLint() {
     // prototype of the createRulesetFunction-wrapped original stay reachable,
     // so ruleset option validation behaves identically.
     const wrapped = new Proxy(orig, {
-      apply(t, thisArg, a) { exampleNodes++; return Reflect.apply(t, thisArg, a); },
+      apply(t, thisArg, a) {
+        exampleNodes++;
+        return Reflect.apply(t, thisArg, a);
+      },
     });
     Object.defineProperty(fns, 'oasExample', { value: wrapped, configurable: true, enumerable: true });
-  } catch { exampleNodes = -1; }
+  } catch {
+    exampleNodes = -1;
+  }
 
   const { Document, DocumentInventory, Runner, Ruleset, Parsers, Resolver } = loadCore();
   const Rulesets = require(`${ROOT}/packages/rulesets/dist/index.js`);
-  const def = RULESET_NAME === 'asyncapi' ? Rulesets.asyncapi : RULESET_NAME === 'arazzo' ? Rulesets.arazzo : Rulesets.oas;
+  const def =
+    RULESET_NAME === 'asyncapi' ? Rulesets.asyncapi : RULESET_NAME === 'arazzo' ? Rulesets.arazzo : Rulesets.oas;
   const ruleset = new Ruleset({ extends: [def] });
 
-  const text = readFileSync(DOC, 'utf8');
+  let input = readFileSync(DOC);
+  const inputBytes = input.byteLength;
+  const inputSha256 = sha256(input);
+  const text = input.toString('utf8');
+  input = null;
   const runs = [];
   let out = null;
 
   for (let i = 0; i < REPEAT; i++) {
-    ajvCompiles = Math.max(0, ajvCompiles); exampleNodes = Math.max(0, exampleNodes);
-    const a0 = ajvCompiles, e0 = exampleNodes;
+    const a0 = ajvCompiles;
+    const e0 = exampleNodes;
     const t0 = performance.now();
 
     const document = new Document(text, Parsers.Yaml, DOC);
     const t1 = performance.now();
+
+    const activeRuleset = rulesetForDocument(ruleset, document);
+    const tRuleset = performance.now();
 
     // Offline resolver: local $refs only. Deterministic, no network variance.
     const inventory = new DocumentInventory(document, new Resolver());
@@ -166,17 +198,14 @@ async function workerLint() {
     const t2 = performance.now();
 
     const runner = new Runner(inventory);
-    if (document.formats === undefined) {
-      const found = [...ruleset.formats].filter(f => f(inventory.resolved, document.source));
-      document.formats = found.length ? new Set(found) : null;
-    }
+    prepareRunner(document, inventory, activeRuleset, runner);
     const t3 = performance.now();
 
     // CPU vs wall for the lint phase. On a shared box these diverge when the
     // process is descheduled; a lintCpuRatio well under 1 means the wall time
     // is contention, not work, and the number should not be compared.
     const cpu0 = process.cpuUsage();
-    await runner.run(ruleset);
+    await runner.run(activeRuleset);
     const cpu1 = process.cpuUsage(cpu0);
     const t4 = performance.now();
 
@@ -185,28 +214,44 @@ async function workerLint() {
     const t5 = performance.now();
 
     runs.push({
-      lintCpuUserMs: cpu1.user / 1000, lintCpuSysMs: cpu1.system / 1000,
-      lintCpuRatio: +(((cpu1.user + cpu1.system) / 1000) / (t4 - t3)).toFixed(3),
-      parseMs: t1 - t0, resolveMs: t2 - t1, formatsMs: t3 - t2,
-      lintMs: t4 - t3, resultsMs: t5 - t4, totalMs: t5 - t0,
-      ajvCompiles: ajvCompiles - a0, exampleNodes: exampleNodes - e0,
-      findings: results.length, rawFindings,
+      lintCpuUserMs: cpu1.user / 1000,
+      lintCpuSysMs: cpu1.system / 1000,
+      lintCpuRatio: +((cpu1.user + cpu1.system) / 1000 / (t4 - t3)).toFixed(3),
+      parseMs: t1 - t0,
+      rulesetMs: tRuleset - t1,
+      resolveMs: t2 - tRuleset,
+      formatsMs: t3 - t2,
+      lintMs: t4 - t3,
+      resultsMs: t5 - t4,
+      totalMs: t5 - t0,
+      ajvCompiles: a0 < 0 ? -1 : ajvCompiles - a0,
+      exampleNodes: e0 < 0 ? -1 : exampleNodes - e0,
+      findings: results.length,
+      rawFindings,
       parserDiagnostics: document.diagnostics.length,
     });
     out = {
       formats: document.formats ? [...document.formats].map(f => f.displayName ?? f.name) : null,
-      enabledRules: Object.values(ruleset.rules).filter(r => r.enabled).length,
+      enabledRules: Object.values(activeRuleset.rules).filter(r => r.enabled).length,
     };
   }
 
   const med = k => {
-    const s = runs.map(r => r[k]).sort((x, y) => x - y), h = s.length >> 1;
+    const s = runs.map(r => r[k]).sort((x, y) => x - y),
+      h = s.length >> 1;
     return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2;
   };
   const keys = Object.keys(runs[0]);
   const median = Object.fromEntries(keys.map(k => [k, med(k)]));
-  emit({ ok: true, ...out, ...median, runs: runs.length,
-         peakRssMB: MB(process.resourceUsage().maxRSS * 1024) });
+  await emit({
+    ok: true,
+    inputBytes,
+    inputSha256,
+    ...out,
+    ...median,
+    runs: runs.length,
+    peakRssMB: MB(process.resourceUsage().maxRSS * 1024),
+  });
 }
 
 /** Pass B: parse + resolve + structural DFS. Untimed on purpose. */
@@ -214,7 +259,11 @@ async function workerStruct() {
   const DOC = arg('doc');
   const CAP = Number(arg('visit-cap', '80000000'));
   const { Document, DocumentInventory, Parsers, Resolver } = loadCore();
-  const text = readFileSync(DOC, 'utf8');
+  let input = readFileSync(DOC);
+  const inputBytes = input.byteLength;
+  const inputSha256 = sha256(input);
+  const text = input.toString('utf8');
+  input = null;
   const document = new Document(text, Parsers.Yaml, DOC);
   const inventory = new DocumentInventory(document, new Resolver());
   await inventory.resolve();
@@ -232,20 +281,33 @@ async function workerStruct() {
    */
   function dfs(root, cap) {
     if (!isObj(root)) return { visits: 0, distinct: 0, capped: false, refs: 0 };
-    let visits = 0, refs = 0, exampleKeys = 0, capped = false;
-    const distinct = new Set(), onPath = new Set(), stack = [];
+    let visits = 0,
+      refs = 0,
+      exampleKeys = 0,
+      capped = false;
+    const distinct = new Set(),
+      onPath = new Set(),
+      stack = [];
     const push = n => {
-      visits++; distinct.add(n);
-      if (onPath.has(n)) return;            // cycle: count, do not descend
+      visits++;
+      distinct.add(n);
+      if (onPath.has(n)) return; // cycle: count, do not descend
       onPath.add(n);
       stack.push({ n, ks: Array.isArray(n) ? null : Object.keys(n), i: 0 });
     };
     push(root);
     while (stack.length) {
-      if (visits >= cap) { capped = true; break; }
+      if (visits >= cap) {
+        capped = true;
+        break;
+      }
       const f = stack[stack.length - 1];
       const len = f.ks ? f.ks.length : f.n.length;
-      if (f.i >= len) { onPath.delete(f.n); stack.pop(); continue; }
+      if (f.i >= len) {
+        onPath.delete(f.n);
+        stack.pop();
+        continue;
+      }
       const k = f.ks ? f.ks[f.i] : f.i;
       const v = f.n[k];
       f.i++;
@@ -258,23 +320,43 @@ async function workerStruct() {
 
   const un = dfs(document.data, CAP);
   const res = dfs(inventory.resolved, CAP);
-  emit({ ok: true,
-    unresolvedVisits: un.visits, unresolvedDistinct: un.distinct, refs: un.refs,
-    exampleKeys: un.exampleKeys, resolvedExampleKeys: res.exampleKeys,
-    resolvedVisits: res.visits, resolvedDistinct: res.distinct,
+  await emit({
+    ok: true,
+    inputBytes,
+    inputSha256,
+    unresolvedVisits: un.visits,
+    unresolvedDistinct: un.distinct,
+    refs: un.refs,
+    exampleKeys: un.exampleKeys,
+    resolvedExampleKeys: res.exampleKeys,
+    resolvedVisits: res.visits,
+    resolvedDistinct: res.distinct,
     capped: un.capped || res.capped,
-    peakRssMB: MB(process.resourceUsage().maxRSS * 1024) });
+    peakRssMB: MB(process.resourceUsage().maxRSS * 1024),
+  });
 }
 
-if (flag('worker-lint')) { await workerLint(); process.exit(0); }
-if (flag('worker-struct')) { await workerStruct(); process.exit(0); }
+if (flag('worker-lint')) {
+  await workerLint();
+  process.exit(0);
+}
+if (flag('worker-struct')) {
+  await workerStruct();
+  process.exit(0);
+}
 
 // ====================================================================== PARENT
 if (flag('help')) {
   // The banner comment at the top of this file IS the manual.
   const doc = readFileSync(SELF, 'utf8');
-  console.log(doc.slice(doc.indexOf('/**'), doc.indexOf('*/'))
-    .split('\n').map(l => l.replace(/^\s*\/?\*+ ?/, '')).join('\n').trim());
+  console.log(
+    doc
+      .slice(doc.indexOf('/**'), doc.indexOf('*/'))
+      .split('\n')
+      .map(l => l.replace(/^\s*\/?\*+ ?/, ''))
+      .join('\n')
+      .trim(),
+  );
   process.exit(0);
 }
 const DIR = pathResolve(process.cwd(), arg('dir', join(ROOT, 'corpora/real')));
@@ -283,78 +365,194 @@ const MAX_MB = Number(arg('max-mb', '64'));
 const MIN_MB = Number(arg('min-mb', '0'));
 const ONLY = args('only');
 const RULESET = arg('ruleset', 'oas');
-const HEAP_MB = arg('heap-mb', '8192');
+const HEAP_MB = Number(arg('heap-mb', '8192'));
 const TIMEOUT_S = Number(arg('timeout-s', '900'));
-const REPEAT = arg('repeat', '1');
+const REPEAT = Number(arg('repeat', '1'));
 const STRUCTURE = !flag('no-structure');
 const SORT = arg('sort', 'size');
 const QUIET = flag('quiet');
+if (!['oas', 'asyncapi', 'arazzo'].includes(RULESET)) {
+  console.error('--ruleset must be oas, asyncapi, or arazzo');
+  process.exit(2);
+}
+if (!Number.isFinite(MAX_MB) || MAX_MB < 0 || !Number.isFinite(MIN_MB) || MIN_MB < 0 || MIN_MB > MAX_MB) {
+  console.error('--min-mb and --max-mb must be non-negative numbers with min <= max');
+  process.exit(2);
+}
+if (!Number.isInteger(HEAP_MB) || HEAP_MB <= 0) {
+  console.error('--heap-mb must be a positive integer');
+  process.exit(2);
+}
+if (!Number.isFinite(TIMEOUT_S) || TIMEOUT_S <= 0) {
+  console.error('--timeout-s must be a positive number');
+  process.exit(2);
+}
+if (!Number.isInteger(REPEAT) || REPEAT <= 0) {
+  console.error('--repeat must be a positive integer');
+  process.exit(2);
+}
+if (!['name', 'size', 'lint', 'rss', 'density'].includes(SORT)) {
+  console.error('--sort must be name, size, lint, rss, or density');
+  process.exit(2);
+}
+
+const childExecArgv = [];
+for (let i = 0; i < process.execArgv.length; i++) {
+  const value = process.execArgv[i];
+  if (value === '--max-old-space-size' || value === '--max_old_space_size') {
+    i++;
+  } else if (!/^--max[-_]old[-_]space[-_]size=/.test(value)) {
+    childExecArgv.push(value);
+  }
+}
+childExecArgv.push(`--max-old-space-size=${HEAP_MB}`);
 
 function runChild(mode, doc, extra = []) {
   return new Promise(res => {
     const started = Date.now();
-    const child = spawn(process.execPath, [
-      `--max-old-space-size=${HEAP_MB}`, SELF, `--${mode}`, '--doc', doc, ...extra,
-    ], { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [...childExecArgv, SELF, `--${mode}`, '--doc', doc, ...extra], {
+      // Preserve the parent's cwd so relative --require/--import flags resolve
+      // to the same hook in the measured children.
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
-    let out = '', err = '', killed = false;
-    const timer = setTimeout(() => { killed = true; child.kill('SIGKILL'); }, TIMEOUT_S * 1000);
-    child.stdout.on('data', d => { out += d; });
-    child.stderr.on('data', d => { err += d.slice(0, 4000); });
-    child.on('error', e => { clearTimeout(timer); res({ ok: false, error: `spawn: ${e.message}` }); });
+    let out = '',
+      err = '',
+      killed = false;
+    const timer = setTimeout(() => {
+      killed = true;
+      child.kill('SIGKILL');
+    }, TIMEOUT_S * 1000);
+    child.stdout.on('data', d => {
+      out += d;
+    });
+    child.stderr.on('data', d => {
+      err += d.slice(0, 4000);
+    });
+    child.on('error', e => {
+      clearTimeout(timer);
+      res({ ok: false, error: `spawn: ${e.message}` });
+    });
     child.on('close', (code, signal) => {
       clearTimeout(timer);
       const wallMs = Date.now() - started;
-      const line = out.split('\n').find(l => l.startsWith(MARKER));
-      if (line !== undefined) {
-        try { return res({ ...JSON.parse(line.slice(MARKER.length)), wallMs }); } catch { /* fallthrough */ }
+      const lines = out.split('\n').filter(line => line.startsWith(MARKER));
+      if (code === 0 && signal === null && lines.length === 1) {
+        try {
+          return res({ ...JSON.parse(lines[0].slice(MARKER.length)), wallMs });
+        } catch {
+          /* fallthrough */
+        }
       }
       const tail = err.trim().split('\n').slice(-6).join(' | ').slice(0, 500);
       const oom = /heap out of memory|Allocation failed|OOM/i.test(err);
-      res({ ok: false, wallMs,
-        error: killed ? `TIMEOUT >${TIMEOUT_S}s` : oom ? 'OOM' : signal ? `signal ${signal}` : `exit ${code}`,
-        stderr: tail });
+      res({
+        ok: false,
+        wallMs,
+        error: killed
+          ? `TIMEOUT >${TIMEOUT_S}s`
+          : oom
+            ? 'OOM'
+            : signal
+              ? `signal ${signal}`
+              : code !== 0
+                ? `exit ${code}`
+                : `expected one result marker, received ${lines.length}`,
+        stderr: tail,
+      });
     });
   });
 }
 
-let files = readdirSync(DIR)
-  .filter(f => /\.(ya?ml|json)$/i.test(f))
-  .map(f => ({ name: f, path: join(DIR, f), size: statSync(join(DIR, f)).size }));
+let files = readdirSync(DIR, { withFileTypes: true })
+  .filter(entry => entry.isFile() && /\.(ya?ml|json)$/i.test(entry.name))
+  .map(entry => {
+    const path = join(DIR, entry.name);
+    const contents = readFileSync(path);
+    return { name: entry.name, path, size: contents.byteLength, sha256: sha256(contents) };
+  });
 
 const skipped = [];
 if (ONLY.length) files = files.filter(f => ONLY.some(o => f.name.includes(o)));
 files = files.filter(f => {
-  if (f.size > MAX_MB * 1048576) { skipped.push({ ...f, reason: `>${MAX_MB}MB` }); return false; }
-  if (f.size < MIN_MB * 1048576) { skipped.push({ ...f, reason: `<${MIN_MB}MB` }); return false; }
+  if (f.size > MAX_MB * 1048576) {
+    skipped.push({ ...f, reason: `>${MAX_MB}MB` });
+    return false;
+  }
+  if (f.size < MIN_MB * 1048576) {
+    skipped.push({ ...f, reason: `<${MIN_MB}MB` });
+    return false;
+  }
   return true;
 });
 files.sort((a, b) => a.size - b.size);
 
 const meta = {
-  dir: DIR, node: process.version, ruleset: RULESET, heapMB: HEAP_MB, repeat: Number(REPEAT),
-  cpus: os.cpus().length, totalMemGB: +(os.totalmem() / 2 ** 30).toFixed(1),
+  ...collectProvenance(ROOT),
+  dir: DIR,
+  ruleset: RULESET,
+  heapMB: HEAP_MB,
+  repeat: REPEAT,
+  cpus: os.cpus().length,
+  totalMemGB: +(os.totalmem() / 2 ** 30).toFixed(1),
   loadavgStart: os.loadavg().map(n => +n.toFixed(2)),
-  startedAt: new Date().toISOString(), structure: STRUCTURE,
+  startedAt: new Date().toISOString(),
+  structure: STRUCTURE,
+  childExecArgv,
+  sweepNoHooks: process.env.SWEEP_NO_HOOKS ?? null,
+  platform: `${os.platform()} ${os.release()} ${os.arch()}`,
+  cpu: os.cpus()[0]?.model ?? null,
 };
 console.error(`sweep: ${files.length} documents (${skipped.length} skipped) from ${DIR}`);
-console.error(`node ${meta.node} heap=${HEAP_MB}MB ruleset=${RULESET} repeat=${REPEAT} loadavg=${meta.loadavgStart.join(' ')}`);
+console.error(
+  `node ${meta.node} heap=${HEAP_MB}MB ruleset=${RULESET} repeat=${REPEAT} loadavg=${meta.loadavgStart.join(' ')}`,
+);
 console.error(`NOTE: shared machine -- treat absolute ms as indicative, ratios as real.\n`);
+
+const verifyChildInput = (result, file, pass) => {
+  if (!result.ok) return;
+  if (result.inputSha256 !== file.sha256 || result.inputBytes !== file.size) {
+    throw new Error(`corpus document bytes read by ${pass} worker did not match the recorded input: ${file.path}`);
+  }
+};
 
 const rows = [];
 for (let i = 0; i < files.length; i++) {
   const f = files[i];
   if (!QUIET) process.stderr.write(`[${String(i + 1).padStart(3)}/${files.length}] ${f.name} (${MB(f.size)}MB) ... `);
-  const lint = await runChild('worker-lint', f.path, ['--ruleset', RULESET, '--repeat', REPEAT]);
+  const documentSha256 = f.sha256;
+  if (sha256(readFileSync(f.path)) !== documentSha256) {
+    throw new Error(`corpus document changed before lint pass: ${f.path}`);
+  }
+  const lint = await runChild('worker-lint', f.path, ['--ruleset', RULESET, '--repeat', String(REPEAT)]);
+  verifyChildInput(lint, f, 'lint');
+  if (sha256(readFileSync(f.path)) !== documentSha256) {
+    throw new Error(`corpus document changed during lint pass: ${f.path}`);
+  }
   const struct = STRUCTURE ? await runChild('worker-struct', f.path) : { ok: false, error: 'skipped' };
+  verifyChildInput(struct, f, 'structure');
+  if (sha256(readFileSync(f.path)) !== documentSha256) {
+    throw new Error(`corpus document changed during structure pass: ${f.path}`);
+  }
   const row = {
-    name: f.name, bytes: f.size, sizeMB: MB(f.size),
+    name: f.name,
+    bytes: f.size,
+    sizeMB: MB(f.size),
+    sha256: documentSha256,
     ...(lint.ok ? lint : { lintError: lint.error, lintStderr: lint.stderr, lintWallMs: lint.wallMs }),
     ...(struct.ok
-      ? { unresolvedVisits: struct.unresolvedVisits, unresolvedDistinct: struct.unresolvedDistinct,
-          refs: struct.refs, exampleKeys: struct.exampleKeys, resolvedExampleKeys: struct.resolvedExampleKeys,
-          resolvedVisits: struct.resolvedVisits, resolvedDistinct: struct.resolvedDistinct,
-          structCapped: struct.capped, structPeakRssMB: struct.peakRssMB }
+      ? {
+          unresolvedVisits: struct.unresolvedVisits,
+          unresolvedDistinct: struct.unresolvedDistinct,
+          refs: struct.refs,
+          exampleKeys: struct.exampleKeys,
+          resolvedExampleKeys: struct.resolvedExampleKeys,
+          resolvedVisits: struct.resolvedVisits,
+          resolvedDistinct: struct.resolvedDistinct,
+          structCapped: struct.capped,
+          structPeakRssMB: struct.peakRssMB,
+        }
       : { structError: struct.error }),
   };
   if (row.refs !== undefined) row.refsPerKB = +(row.refs / (f.size / 1024)).toFixed(3);
@@ -369,13 +567,16 @@ for (let i = 0; i < files.length; i++) {
   if (row.rawFindings !== undefined) row.dropped = row.rawFindings - row.findings;
   rows.push(row);
   if (!QUIET) {
-    process.stderr.write(lint.ok
-      ? `lint ${lint.lintMs.toFixed(0)}ms rss ${lint.peakRssMB}MB findings ${lint.findings}\n`
-      : `FAILED: ${lint.error}\n`);
+    process.stderr.write(
+      lint.ok
+        ? `lint ${lint.lintMs.toFixed(0)}ms rss ${lint.peakRssMB}MB findings ${lint.findings}\n`
+        : `FAILED: ${lint.error}\n`,
+    );
   }
 }
 meta.loadavgEnd = os.loadavg().map(n => +n.toFixed(2));
 meta.finishedAt = new Date().toISOString();
+assertExecutableProvenanceUnchanged(meta, collectProvenance(ROOT), 'sweep');
 
 // ------------------------------------------------------------------- printing
 const n = (v, d = 0) => (v === undefined || v === null ? '-' : Number(v).toFixed(d));
@@ -390,7 +591,7 @@ const sorters = {
 const view = [...rows].sort(sorters[SORT] ?? sorters.size);
 
 const COLS = [
-  ['document', 42, r => r.name.length > 42 ? r.name.slice(0, 39) + '...' : r.name, 'l'],
+  ['document', 42, r => (r.name.length > 42 ? r.name.slice(0, 39) + '...' : r.name), 'l'],
   ['MB', 7, r => n(r.sizeMB, 1)],
   ['refs', 7, r => k(r.refs)],
   ['ref/KB', 7, r => n(r.refsPerKB, 2)],
@@ -399,7 +600,7 @@ const COLS = [
   ['parse', 7, r => n(r.parseMs)],
   ['resolv', 7, r => n(r.resolveMs)],
   ['lint', 8, r => n(r.lintMs)],
-  ['ms/MB', 7, r => n(r.lintMs / r.sizeMB)],
+  ['ms/MB', 7, r => n(r.lintMs / (r.bytes / 1048576))],
   ['RSS', 7, r => n(r.peakRssMB)],
   ['find', 6, r => k(r.findings)],
   ['drop', 5, r => k(r.dropped)],
@@ -414,17 +615,39 @@ console.log(line(COLS.map(([h, w, , al]) => (al === 'l' ? h.padEnd(w) : h.padSta
 console.log(line(COLS.map(([, w]) => '-'.repeat(w))));
 for (const r of view) {
   if (r.lintError) {
-    console.log(`${(r.name.length > 42 ? r.name.slice(0, 39) + '...' : r.name).padEnd(42)} ${n(r.sizeMB, 1).padStart(7)}  !! ${r.lintError}${r.lintStderr ? ' :: ' + r.lintStderr.slice(0, 120) : ''}`);
+    console.log(
+      `${(r.name.length > 42 ? r.name.slice(0, 39) + '...' : r.name).padEnd(42)} ${n(r.sizeMB, 1).padStart(7)}  !! ${r.lintError}${r.lintStderr ? ' :: ' + r.lintStderr.slice(0, 120) : ''}`,
+    );
     continue;
   }
-  console.log(line(COLS.map(([, w, fn, al]) => { let v; try { v = String(fn(r)); } catch { v = '-'; } return al === 'l' ? v.padEnd(w) : v.padStart(w); })));
+  console.log(
+    line(
+      COLS.map(([, w, fn, al]) => {
+        let v;
+        try {
+          v = String(fn(r));
+        } catch {
+          v = '-';
+        }
+        return al === 'l' ? v.padEnd(w) : v.padStart(w);
+      }),
+    ),
+  );
 }
 
 const ok = rows.filter(r => !r.lintError);
 const sum = key => ok.reduce((a, r) => a + (r[key] ?? 0), 0);
-console.log(`\n${ok.length} ok, ${rows.filter(r => r.lintError).length} failed, ${skipped.length} skipped (cap ${MAX_MB}MB)`);
-console.log(`totals: ${MB(sum('bytes'))}MB  lint ${(sum('lintMs') / 1000).toFixed(1)}s  resolve ${(sum('resolveMs') / 1000).toFixed(1)}s  parse ${(sum('parseMs') / 1000).toFixed(1)}s  findings ${sum('findings').toLocaleString()}  ajv ${sum('ajvCompiles').toLocaleString()}`);
+const ajvTotal = ok.some(row => row.ajvCompiles < 0) ? 'unavailable' : sum('ajvCompiles').toLocaleString();
+console.log(
+  `\n${ok.length} ok, ${rows.filter(r => r.lintError).length} failed, ${skipped.length} skipped (cap ${MAX_MB}MB)`,
+);
+console.log(
+  `totals: ${MB(sum('bytes'))}MB  lint ${(sum('lintMs') / 1000).toFixed(1)}s  resolve ${(sum('resolveMs') / 1000).toFixed(1)}s  parse ${(sum('parseMs') / 1000).toFixed(1)}s  findings ${sum('findings').toLocaleString()}  ajv ${ajvTotal}`,
+);
 console.log(`loadavg start ${meta.loadavgStart.join(' ')} -> end ${meta.loadavgEnd.join(' ')}`);
 for (const s of skipped) console.log(`skipped: ${s.name} (${MB(s.size)}MB) ${s.reason}`);
 
-if (OUT) { writeFileSync(OUT, JSON.stringify({ meta, rows, skipped }, null, 2)); console.log(`\nwrote ${OUT}`); }
+if (OUT) {
+  writeFileSync(OUT, JSON.stringify({ meta, rows, skipped }, null, 2));
+  console.log(`\nwrote ${OUT}`);
+}

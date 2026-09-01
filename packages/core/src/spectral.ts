@@ -87,6 +87,15 @@ export class Spectral {
     this.ruleset = ruleset instanceof Ruleset ? ruleset : new Ruleset(ruleset);
   }
 
+  /**
+   * Clears parsed and resolved documents cached by this instance's resolver.
+   * This affects every Spectral instance that shares the resolver. Do not call
+   * while any run using that resolver is still in flight.
+   */
+  public clearCache(): void {
+    DocumentInventory.clearCache(this._resolver);
+  }
+
   private _generateUnrecognizedFormatError(document: IDocument, formats: Format[]): ISpectralDiagnostic {
     return generateDocumentWideResult(
       document,

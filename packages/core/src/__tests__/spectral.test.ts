@@ -3,10 +3,35 @@ import { truthy } from '@stoplight/spectral-functions';
 import * as Parsers from '@stoplight/spectral-parsers';
 import { Resolver } from '@stoplight/spectral-ref-resolver';
 import { Document } from '../document';
+import { DocumentInventory } from '../documentInventory';
 import { Spectral } from '../spectral';
 import { Ruleset } from '../ruleset';
 
 describe('spectral', () => {
+  describe('clearCache', () => {
+    test('purges resolver entries and releases cached remote documents', () => {
+      const resolver = new Resolver();
+      const spectral = new Spectral({ resolver });
+      const document = new Document('{}', Parsers.Json, 'first.json');
+      const firstInventory = new DocumentInventory(document, resolver);
+      const remote = new Document('{}', Parsers.Json, 'remote.json');
+      firstInventory.referencedDocuments['remote.json'] = remote;
+
+      const sharedInventory = new DocumentInventory(document, resolver);
+      expect(sharedInventory.referencedDocuments['remote.json']).toBe(remote);
+      resolver.uriCache.set('https://example.com/cached.json', { retained: document });
+
+      const purge = jest.spyOn(resolver.uriCache, 'purge');
+      spectral.clearCache();
+
+      expect(purge).toHaveBeenCalledTimes(1);
+      expect(resolver.uriCache.has('https://example.com/cached.json')).toBe(false);
+      const freshInventory = new DocumentInventory(document, resolver);
+      expect(freshInventory.referencedDocuments).not.toBe(firstInventory.referencedDocuments);
+      expect(freshInventory.referencedDocuments).toEqual({});
+    });
+  });
+
   describe('when a $ref appears', () => {
     describe('and a custom resolver is provided', () => {
       test('will call the resolver with target', async () => {

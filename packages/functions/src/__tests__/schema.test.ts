@@ -8,6 +8,25 @@ import AggregateError = require('es-aggregate-error');
 const runSchema = testFunction.bind(null, schema);
 
 describe('Core Functions / Schema', () => {
+  it('accepts symbol-keyed internal options while rejecting unknown string options', async () => {
+    const compilationMode = Symbol.for('@stoplight/spectral-functions/schemaCompilationMode');
+    const futureInternalOption = Symbol('future-internal-option');
+    const options = {
+      schema: { type: 'string' },
+      [compilationMode]: 0,
+      [futureInternalOption]: true,
+    };
+
+    expect(() => schema.validator(options)).not.toThrow();
+    expect(() => schema.validator({ ...options, unknown: true })).toThrow(AggregateError);
+    expect(await runSchema(1, options)).toStrictEqual([
+      {
+        message: 'Value type must be string',
+        path: [],
+      },
+    ]);
+  });
+
   it('validates draft 4', async () => {
     const schema = {
       $schema: 'http://json-schema.org/draft-04/schema#',
