@@ -29,8 +29,18 @@
  *
  * Reports throughput and latency percentiles. On a shared machine, compare
  * RATIOS between two builds, not absolute numbers.
+ *
+ * CONCURRENCY IS CAPPED BY DOCUMENT SIZE. Peak RSS during a lint runs roughly
+ * 40-60x the source bytes, so the requested concurrency is only safe for small
+ * documents: 50 workers on a 25MB corpus would ask for ~75GB. The cap is derived
+ * from the corpus's mean document size and --budget-gb (default 8), and the
+ * effective concurrency is printed. Raise the budget deliberately, not by
+ * accident.
+ *
+ *   node scripts/bench/loadtest.mjs --profile tp1k --dir corpora/bands/b100k
+ *   node scripts/bench/loadtest.mjs --profile heavy --bands            # every band
  */
-import { readdirSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
 import { dirname, resolve as pathResolve } from 'node:path';
@@ -100,6 +110,13 @@ if (isMainThread) {
     const i = argv.indexOf(`--${n}`);
     return i === -1 ? d : argv[i + 1];
   };
+  const BUDGET_GB = Number(arg('budget-gb', 8));
+  // Request counts are calibrated for small documents. tp10k over a 25MB band is
+  // days of work, so --scale divides every stage's request count (warmup aside)
+  // and the pre-flight estimate below refuses to start a stage silently.
+  const SCALE = Number(arg('scale', 1));
+  const MAX_STAGE_S = Number(arg('max-stage-s', 0)); // 0 = no limit, just warn
+  const RSS_PER_BYTE = 60; // measured: lint peak RSS is ~40-60x source size
   const DIR = pathResolve(ROOT, arg('dir', 'corpora/small'));
   const WANT = arg('profile', 'light');
   const JSON_OUT = arg('json');
@@ -109,6 +126,42 @@ if (isMainThread) {
       console.error(`unknown profile "${n}" -- have: ${Object.keys(PROFILES).join(', ')}, or all`);
       process.exit(2);
     }
+  }
+
+  // --bands: run the same profile against every corpora/bands/* directory and
+  // print one comparison table, so a size effect is visible rather than averaged away.
+  if (argv.includes('--bands')) {
+    const base = pathResolve(ROOT, 'corpora/bands');
+    const dirs = readdirSync(base).sort();
+    const self = fileURLToPath(import.meta.url);
+    const { spawnSync } = await import('node:child_process');
+    const collected = [];
+    for (const d of dirs) {
+      const tmp = `/tmp/loadtest-${d}.json`;
+      const r = spawnSync(
+        process.execPath,
+        [self, '--profile', WANT, '--dir', `${base}/${d}`, '--json', tmp, '--budget-gb', String(BUDGET_GB)],
+        { stdio: ['ignore', 'inherit', 'inherit'] },
+      );
+      if (r.status !== 0) {
+        console.error(`band ${d} failed`);
+        continue;
+      }
+      const j = JSON.parse(readFileSync(tmp, 'utf8'));
+      for (const [p, stages] of Object.entries(j.profiles))
+        for (const st of stages) collected.push({ band: d, profile: p, ...st });
+    }
+    const H = ['band', 'profile', 'stage', 'req', 'conc', 'wall ms', 'req/s', 'p50', 'p95', 'p99', 'err', 'rssMB'];
+    const rows = collected.map(c =>
+      [c.band, c.profile, c.stage, c.requests, c.concurrency, c.wallMs, c.rps, c.p50, c.p95, c.p99, c.errors, c.peakWorkerRssMB].map(String),
+    );
+    const w = H.map((h, i) => Math.max(h.length, ...rows.map(r => r[i].length)));
+    console.log('\n=== ALL BANDS ===');
+    console.log(H.map((h, i) => h.padStart(w[i])).join('  '));
+    console.log(w.map(n => '-'.repeat(n)).join('  '));
+    for (const r of rows) console.log(r.map((c, i) => c.padStart(w[i])).join('  '));
+    if (JSON_OUT !== undefined) writeFileSync(JSON_OUT, JSON.stringify(collected, null, 1));
+    process.exit(0);
   }
 
   const corpus = readdirSync(DIR)
@@ -122,7 +175,8 @@ if (isMainThread) {
 
   const pct = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)];
 
-  async function runStage({ requests, concurrency }, startIndex, warmup) {
+  async function runStage({ requests, concurrency }, startIndex, warmup, cap) {
+    concurrency = Math.max(1, Math.min(concurrency, cap));
     const workers = [];
     const ready = [];
     for (let i = 0; i < concurrency; i++) {
@@ -178,7 +232,8 @@ if (isMainThread) {
     lat.sort((a, b) => a - b);
     return {
       requests,
-      concurrency,
+      concurrency, // effective, after the size cap
+
       wallMs: +wall.toFixed(0),
       rps: +((requests / wall) * 1000).toFixed(1),
       p50: +pct(lat, 50).toFixed(1),
@@ -192,21 +247,35 @@ if (isMainThread) {
     };
   }
 
-  console.log(`corpus ${DIR} (${corpus.length} docs) | ${cpus().length} cpus | load ${loadavg()[0].toFixed(2)}`);
+  const meanBytes = corpus.reduce((a, f) => a + statSync(f).size, 0) / corpus.length;
+  const cap = Math.max(1, Math.floor((BUDGET_GB * 1024 ** 3) / (meanBytes * RSS_PER_BYTE)));
+  console.log(`corpus ${DIR} (${corpus.length} docs, mean ${(meanBytes / 1048576).toFixed(2)}MB) | ${cpus().length} cpus | load ${loadavg()[0].toFixed(2)}`);
+  console.log(`concurrency cap ${cap} (from --budget-gb ${BUDGET_GB} at ~${RSS_PER_BYTE}x source size)`);
   console.log('a "request" = one library lint of one document; each concurrent slot is a worker_thread\n');
 
   const out = {};
   let cursor = 0;
   for (const name of names) {
     process.stderr.write(`[${name}] warmup ${WARMUP.requests}x${WARMUP.concurrency} ... `);
-    await runStage(WARMUP, cursor, true);
+    const warm = await runStage(WARMUP, cursor, true, cap);
     cursor += WARMUP.requests;
-    process.stderr.write('done\n');
+    process.stderr.write(`done (p50 ${warm.p50}ms)\n`);
 
     out[name] = [];
-    for (const stage of PROFILES[name]) {
-      process.stderr.write(`[${name}${stage.label ? ':' + stage.label : ''}] ${stage.requests}x${stage.concurrency} ... `);
-      const r = await runStage(stage, cursor, false);
+    for (const raw of PROFILES[name]) {
+      const stage = { ...raw, requests: Math.max(1, Math.round(raw.requests / SCALE)) };
+      const conc = Math.min(stage.concurrency, cap);
+      // Estimate from the warmup's median latency, which is measured on this
+      // corpus with this build -- not a guess.
+      const estS = (stage.requests * warm.p50) / conc / 1000;
+      const label = `${name}${stage.label ? ':' + stage.label : ''}`;
+      if (MAX_STAGE_S > 0 && estS > MAX_STAGE_S) {
+        process.stderr.write(`[${label}] SKIPPED: estimated ${estS.toFixed(0)}s exceeds --max-stage-s ${MAX_STAGE_S}\n`);
+        continue;
+      }
+      if (estS > 120) process.stderr.write(`[${label}] note: estimated ~${estS.toFixed(0)}s\n`);
+      process.stderr.write(`[${label}] ${stage.requests}x${conc} ... `);
+      const r = await runStage(stage, cursor, false, cap);
       cursor += stage.requests;
       out[name].push({ stage: stage.label ?? name, ...r });
       process.stderr.write(`${r.wallMs}ms ${r.rps} rps\n`);
