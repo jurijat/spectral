@@ -75,6 +75,18 @@ export function createAjvInstances(): AssignAjvInstance {
   };
 
   const compiledSchemas = new WeakMap<AjvCore, WeakMap<SchemaObject, ValidateFunction>>();
+  // Keyed on schema STRUCTURE, not identity. Documents inline the same schema
+  // shape at many locations -- on github.com@1.1.4, 5,206 compilations covered
+  // only 1,677 distinct schemas (67.8% redundant); on microsoft.com:graph,
+  // 1,226 covered 408 (66.7%). The identity-keyed WeakMap above cannot see
+  // that, so each duplicate was compiled again and then pinned for the process
+  // lifetime by ajv's own strong `_cache` Map (ajv/dist/core.js).
+  //
+  // Bounded, because unlike the WeakMap this holds its keys: a long-lived
+  // process linting many documents would otherwise accumulate validators for
+  // every shape it ever saw.
+  const STRUCTURAL_CACHE_MAX = 4096;
+  const structuralCache = new WeakMap<AjvCore, Map<string, ValidateFunction>>();
 
   return function (schema, dialect, allErrors): ValidateFunction {
     const instances = (ajvInstances[dialect] ?? ajvInstances.auto) as ReturnType<typeof _createAjvInstances>;
@@ -84,11 +96,42 @@ export function createAjvInstances(): AssignAjvInstance {
 
     if (typeof $id === 'string') {
       return ajv.getSchema($id) ?? ajv.compile(schema);
-    } else {
-      const actualCompiledSchemas =
-        compiledSchemas.get(ajv) ?? compiledSchemas.set(ajv, new WeakMap<SchemaObject, ValidateFunction>()).get(ajv)!;
-
-      return actualCompiledSchemas.get(schema) ?? actualCompiledSchemas.set(schema, ajv.compile(schema)).get(schema)!;
     }
+
+    const actualCompiledSchemas =
+      compiledSchemas.get(ajv) ?? compiledSchemas.set(ajv, new WeakMap<SchemaObject, ValidateFunction>()).get(ajv)!;
+
+    const byIdentity = actualCompiledSchemas.get(schema);
+    if (byIdentity !== void 0) return byIdentity;
+
+    let structural = structuralCache.get(ajv);
+    if (structural === void 0) {
+      structural = new Map<string, ValidateFunction>();
+      structuralCache.set(ajv, structural);
+    }
+
+    let key: string | null;
+    try {
+      key = JSON.stringify(schema);
+    } catch {
+      key = null; // circular or otherwise unserialisable -- fall back to compiling
+    }
+
+    if (key !== null) {
+      const hit = structural.get(key);
+      if (hit !== void 0) {
+        actualCompiledSchemas.set(schema, hit);
+        return hit;
+      }
+    }
+
+    const validate = ajv.compile(schema);
+    actualCompiledSchemas.set(schema, validate);
+    if (key !== null) {
+      if (structural.size >= STRUCTURAL_CACHE_MAX) structural.clear();
+      structural.set(key, validate);
+    }
+
+    return validate;
   };
 }
