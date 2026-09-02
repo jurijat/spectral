@@ -65,3 +65,37 @@ diff --git a/node_modules/@stoplight/yaml/getLocationForJsonPath.js b/node_modul
  function getMappings(mappings, mergeKeys) {
      if (!mergeKeys)
          return mappings;
+diff --git a/node_modules/@stoplight/yaml/parseWithPointers.js b/node_modules/@stoplight/yaml/parseWithPointers.js
+--- a/node_modules/@stoplight/yaml/parseWithPointers.js
++++ b/node_modules/@stoplight/yaml/parseWithPointers.js
+@@ -8,6 +8,20 @@
+ const lineForPosition_1 = require("./lineForPosition");
+ const types_2 = require("./types");
+ const utils_1 = require("./utils");
++// `createObj({})` seeds the order array by pushing, so V8 grows its backing
++// store to the next capacity step (0 -> 16 -> 40 -> 76 ...). A YAML mapping has
++// 3.6 keys on average, so the store is ~4x larger than the data it holds -- and
++// unlike a normal transient over-allocation this one is LIVE for as long as the
++// data graph is. `compactOrder` swaps in an exactly-sized copy once the mapping
++// is complete; `slice()` allocates a packed FixedArray of exactly `length`.
++const ORDER_KEY = Symbol.for(ordered_object_literal_1.ORDER_KEY_ID);
++function compactOrder(container) {
++    const order = ordered_object_literal_1.getOrder(container);
++    // Redefining is safe: setOrder() installs ORDER_KEY as configurable, the
++    // copy still carries ORDER_KEY itself so the defineProperty trap does not
++    // re-append it, and ownKeys keeps returning the same keys in the same order.
++    Object.defineProperty(container, ORDER_KEY, { configurable: true, value: order.slice() });
++}
+ exports.parseWithPointers = (value, options) => {
+     const lineMap = computeLineMap(value);
+     const ast = yaml_ast_parser_1.load(value, Object.assign({}, options, { ignoreDuplicateKeys: true }));
+@@ -87,6 +101,9 @@
+                     mappingComments.attachComments();
+                 }
+                 mapComments.attachComments();
++                if (preserveKeyOrder) {
++                    compactOrder(container);
++                }
+                 return container;
+             }
+             case types_2.Kind.SEQ: {
