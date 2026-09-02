@@ -1,66 +1,91 @@
 diff --git a/node_modules/dependency-graph/lib/dep_graph.js b/node_modules/dependency-graph/lib/dep_graph.js
 --- a/node_modules/dependency-graph/lib/dep_graph.js
 +++ b/node_modules/dependency-graph/lib/dep_graph.js
-@@ -72,6 +72,7 @@ var DepGraph = (exports.DepGraph = function DepGraph(opts) {
+@@ -72,6 +72,7 @@
    this.nodes = {}; // Node -> Node/Data (treated like a Set)
    this.outgoingEdges = {}; // Node -> [Dependency Node]
    this.incomingEdges = {}; // Node -> [Dependant Node]
-+  this._outgoingEdgeSets = Object.create(null); // Node -> Set(Dependency Node)
++  this._outgoingEdgeIndex = new Map(); // Node -> Set(Dependency Node)
    this.circular = opts && !!opts.circular; // Allows circular deps
  });
  DepGraph.prototype = {
-@@ -94,6 +95,7 @@ DepGraph.prototype = {
+@@ -94,6 +95,7 @@
        }
        this.outgoingEdges[node] = [];
        this.incomingEdges[node] = [];
-+      this._outgoingEdgeSets[node] = new Set();
++      this._outgoingEdgeIndex.set(node, new Set());
      }
    },
    /**
-@@ -101,9 +103,13 @@ DepGraph.prototype = {
+@@ -101,9 +103,16 @@
     */
    removeNode: function (node) {
      if (this.hasNode(node)) {
 +      this.incomingEdges[node].forEach(function (from) {
-+        this._outgoingEdgeSets[from].delete(node);
++        var outgoing = this._outgoingEdgeIndex.get(from);
++        if (outgoing !== undefined) {
++          outgoing.delete(node);
++        }
 +      }, this);
        delete this.nodes[node];
        delete this.outgoingEdges[node];
        delete this.incomingEdges[node];
-+      delete this._outgoingEdgeSets[node];
++      this._outgoingEdgeIndex.delete(node);
        [this.incomingEdges, this.outgoingEdges].forEach(function (edgeList) {
          Object.keys(edgeList).forEach(function (key) {
            var idx = edgeList[key].indexOf(node);
-@@ -151,10 +157,9 @@ DepGraph.prototype = {
+@@ -141,6 +150,20 @@
+     }
+   },
+   /**
++   * Membership index over outgoingEdges[node], so addDependency and
++   * removeDependency are O(1) instead of O(edges). It is a pure cache derived
++   * from outgoingEdges: a missing entry is rebuilt from the array, so a missed
++   * update can only ever cost time, not correctness.
++   */
++  _outgoingSet: function (node) {
++    var outgoing = this._outgoingEdgeIndex.get(node);
++    if (outgoing === undefined) {
++      outgoing = new Set(this.outgoingEdges[node] || []);
++      this._outgoingEdgeIndex.set(node, outgoing);
++    }
++    return outgoing;
++  },
++  /**
+    * Add a dependency between two nodes. If either of the nodes does not exist,
+    * an Error will be thrown.
+    */
+@@ -151,10 +174,10 @@
      if (!this.hasNode(to)) {
        throw new Error("Node does not exist: " + to);
      }
 -    if (this.outgoingEdges[from].indexOf(to) === -1) {
-+    if (!this._outgoingEdgeSets[from].has(to)) {
-+      this._outgoingEdgeSets[from].add(to);
++    var outgoing = this._outgoingSet(from);
++    if (!outgoing.has(to)) {
++      outgoing.add(to);
        this.outgoingEdges[from].push(to);
 -    }
 -    if (this.incomingEdges[to].indexOf(from) === -1) {
        this.incomingEdges[to].push(from);
      }
      return true;
-@@ -165,6 +170,7 @@ DepGraph.prototype = {
+@@ -165,6 +188,7 @@
    removeDependency: function (from, to) {
      var idx;
      if (this.hasNode(from)) {
-+      this._outgoingEdgeSets[from].delete(to);
++      this._outgoingSet(from).delete(to);
        idx = this.outgoingEdges[from].indexOf(to);
        if (idx >= 0) {
          this.outgoingEdges[from].splice(idx, 1);
-@@ -190,6 +196,7 @@ DepGraph.prototype = {
+@@ -190,6 +214,7 @@
        result.nodes[n] = source.nodes[n];
        result.outgoingEdges[n] = source.outgoingEdges[n].slice(0);
        result.incomingEdges[n] = source.incomingEdges[n].slice(0);
-+      result._outgoingEdgeSets[n] = new Set(source._outgoingEdgeSets[n]);
++      result._outgoingEdgeIndex.set(n, new Set(result.outgoingEdges[n]));
      });
      return result;
    },
-@@ -313,9 +320,10 @@ DepGraph.prototype = {
+@@ -313,9 +338,10 @@
        // nodes that did not end up in the initial result (as they are part of a
        // subgraph that does not have a clear starting point)
        if (this.circular) {
