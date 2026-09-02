@@ -39,12 +39,29 @@ cache A/B below, `oas` ruleset, Node v24.5.0:
 resolution is 5–12%. An earlier synthetic corpus made resolution look like 51%;
 it was 4–10x more ref-dense than any real spec. Do not plan against synthetics.
 
-Two regimes, and a document can be in both:
+**Three** regimes, and a document can be in more than one. Which regime a document
+is in decides which fix helps it; nothing here generalises across all three:
 
-- **Ref-dense** (MS Graph, 52,610 refs): traversal-bound. nimma `_traverse` is
-  **42%** of wall clock, because $ref inlining makes the resolved graph walk the
-  same shared schema once per reference.
-- **Example-dense** (GitHub, 4,354 examples): was validator-bound. Fixed below.
+- **Ref-dense** (MS Graph, 52,610 refs): traversal-bound, and its peak RSS is
+  reached during **resolve** — lint adds ~0MB. nimma `_traverse` is **42%** of wall
+  clock, because $ref inlining makes the resolved graph walk the same shared schema
+  once per reference.
+- **Example-dense** (GitHub, 4,354 examples): peak is reached during **lint**,
+  driven by ajv schema compilation. Largely fixed below.
+- **Parse-bound** (stripe, kubernetes): peak is reached during **parse**; lint adds
+  0.5–1.2x source. Nothing in the lint-phase work moves these documents.
+
+A correction worth keeping: "peak RSS is reached inside the lint phase" was
+generalised from GitHub alone and is **false** for the other two regimes.
+
+### Current state (measured on HEAD, Node v24.5.0, after all landed work)
+
+| document            |   size | parse | resolve |    lint |  total | peak RSS |
+| ------------------- | -----: | ----: | ------: | ------: | -----: | -------: |
+| microsoft.com:graph | 24.6MB | 1.7s  |    4.0s |   31.2s | 37.0s  |  1,327MB |
+| github.com          |  8.4MB | 0.6s  |    1.0s |    4.1s |  5.8s  |    656MB |
+| stripe.com          |  3.5MB | 0.2s  |    0.5s |    2.2s |  2.9s  |    353MB |
+| kubernetes.io       |  3.2MB | 0.2s  |    0.4s |    1.2s |  1.7s  |    331MB |
 
 ---
 
@@ -121,6 +138,22 @@ Two regimes, and a document can be in both:
       `source`, `documentationUrl`, and result _ordering_.
 - [x] **Real corpora** — `scripts/bench/fetch-corpora.mjs` + committed size index
       over APIs.guru's 3,955 documents.
+- [x] **Fix the dependency-graph edge index on removal** — our own `_oidx` was
+      never updated by `removeDependency`/`removeNode`, so after any removal the
+      index claimed edges the arrays no longer had and a re-added edge was silently
+      dropped. json-ref-resolver does not remove edges during a normal resolve, so
+      it never surfaced, but the patch is ours and so was the bug. Now a
+      `Map<from, Set<to>>` maintained by every mutation, with a regression test.
+- [x] **Right-size the key-order array** in parsed YAML mappings —
+      ordered-object-literal grows its order array in V8 capacity steps (16, 40,
+      76, ...) while mappings average ~3.6 keys, so the store was ~4x the data and
+      live for as long as the data graph.
+
+      These two were measured **together**: peak RSS 1,360MB → 1,327MB on MS Graph
+      (−2.4%), 663MB → 656MB on GitHub (−1.1%), 332MB → 331MB on kubernetes.
+      Earlier per-item estimates of 88MB and 22.8MB were **structure-size**
+      measurements taken destructively; they are not peak-RSS deltas and should not
+      be quoted as such. The correctness fix is the reason to keep the first one.
 
 Cumulative on a ref-dense 20MB synthetic: **134.5s → 15.9s**. On real
 github.com@1.1.4, the `oasExample` fix moved **20.7s → 8.2s** and
@@ -131,6 +164,24 @@ run / 550MB peak RSS**. Equivalence output remained byte-identical on GitHub,
 MS Graph, OAS 2, OAS 3.1 and AsyncAPI 2.
 
 ---
+
+## Measurement rules learned the hard way
+
+Three claims in this document have had to be walked back for the same class of
+error. Before promoting a number here:
+
+1. **A structure's size is not a peak-RSS delta.** Destructively dropping a
+   structure and forcing GC tells you what it retains, not what the process
+   high-water mark would have been without it. Quote both, separately.
+2. **Do not generalise from one document.** "Peak is inside lint" (GitHub-only),
+   "resolve is 51% of wall clock" (a synthetic 4–10x too ref-dense), and the −53%
+   heap-cap figure were all true of exactly one corpus.
+3. **Re-measure after every landed change.** The heap-cap lever shrank from −53%
+   to −12% on GitHub purely because an earlier fix removed the churn it was
+   reclaiming. Stale levers look like available wins.
+4. **Sample RSS from a worker thread.** Parse, resolve and lint block the main
+   event loop, so a `setInterval` sampler there records nothing during the phases
+   that matter.
 
 ## Next — measurement (do first, it re-ranks everything below)
 
@@ -150,6 +201,17 @@ MS Graph, OAS 2, OAS 3.1 and AsyncAPI 2.
       before scheduling any chunked-Immer work.
 - [ ] **Add a CI perf gate** on 3–4 real documents with a ratio threshold, so none
       of the above regresses silently.
+- [x] **Re-measure the V8 heap-cap lever on HEAD.** It is regime-split, and the
+      previously quoted −53% is stale: the structural validator cache removed the
+      ajv churn V8 was growing the heap to absorb.
+
+      | document            | default | capped     |   RSS | time |
+      | ------------------- | ------: | ---------- | ----: | ---: |
+      | github.com          |   654MB | 576MB @512 |  −12% | +18% |
+      | microsoft.com:graph | 1,360MB | 909MB @768 |  −33% | +20% |
+
+      Findings identical at every cap. Worth taking on ref-dense documents, a poor
+      trade on example-dense ones.
 - [ ] **Explain peak-RSS variance under equivalent runs.** Three isolated final
       GitHub runs produced 544/550/702MB while findings, executable provenance
       and input bytes were identical. CPU time was much tighter. Capture V8 space
@@ -183,8 +245,10 @@ MS Graph, OAS 2, OAS 3.1 and AsyncAPI 2.
 - [ ] **`Document` pins the raw input string forever** (`document.ts:34`) with no
       reader after `parser.parse()`. ~21MB, one line — but Stage-C range work will
       want the source, so land them together.
-- [ ] **`preserveKeyOrder`** — the ordering Proxy on every map costs ~363MB and
-      1.28x. JS already preserves insertion order for string keys; only
+- [ ] **`preserveKeyOrder`** — on real documents the ordering Proxy costs **59.1MB
+      on MS Graph (40% of the data graph)** and 20.0MB on GitHub. The often-quoted
+      "~363MB and 1.28x" came from a synthetic and should not be reused.
+      JS already preserves insertion order for string keys; only
       integer-like keys (response status codes) are affected. Needs to be an
       opt-out, not a silent flip. **Do not** try selective wrapping — measured, and
       it makes `run` _worse_ (12.8s → 16.4s) because mixed shapes turn rule
