@@ -116,3 +116,41 @@ describe('spectral', () => {
     });
   });
 });
+
+describe('resolver cache lifetime', () => {
+  const doc = (): Document =>
+    new Document(`openapi: "3.0.0"\ninfo:\n  title: t\n  version: "1"\npaths: {}\n`, Parsers.Yaml, 'file:///t.yaml');
+
+  it('purges the resolver cache after a run by default', async () => {
+    const spectral = new Spectral();
+    spectral.setRuleset({ rules: {} });
+    const purge = jest.spyOn(spectral['_resolver'].uriCache, 'purge');
+
+    await spectral.run(doc());
+
+    expect(purge).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the cache across runs when asked to', async () => {
+    const spectral = new Spectral({ resolverCache: 'shared' });
+    spectral.setRuleset({ rules: {} });
+    const purge = jest.spyOn(spectral['_resolver'].uriCache, 'purge');
+
+    await spectral.run(doc());
+    await spectral.run(doc());
+
+    expect(purge).not.toHaveBeenCalled();
+  });
+
+  it('does not purge while another run is still in flight', async () => {
+    const spectral = new Spectral();
+    spectral.setRuleset({ rules: {} });
+    const purge = jest.spyOn(spectral['_resolver'].uriCache, 'purge');
+
+    // Both runs overlap; the cache must survive until the last one settles,
+    // otherwise the earlier run loses documents it is still resolving against.
+    await Promise.all([spectral.run(doc()), spectral.run(doc())]);
+
+    expect(purge).toHaveBeenCalledTimes(1);
+  });
+});

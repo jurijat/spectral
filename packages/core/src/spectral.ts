@@ -16,6 +16,13 @@ export * from './types';
 
 export class Spectral {
   private readonly _resolver: Resolver;
+  private readonly _resolverCache: 'per-run' | 'shared';
+  /**
+   * Runs currently executing against `_resolver`. The cache may only be purged
+   * once this reaches zero: concurrent `run()` calls share the resolver, and
+   * clearing it under an in-flight run would drop documents that run still needs.
+   */
+  private _runsInFlight = 0;
 
   public ruleset?: Ruleset;
 
@@ -25,6 +32,8 @@ export class Spectral {
     } else {
       this._resolver = createHttpAndFileResolver();
     }
+
+    this._resolverCache = opts?.resolverCache ?? 'per-run';
   }
 
   protected parseDocument(target: IParsedResult | IDocument | Record<string, unknown> | string): IDocument {
@@ -39,6 +48,26 @@ export class Spectral {
   }
 
   public async runWithResolved(
+    target: IParsedResult | IDocument | Record<string, unknown> | string,
+    opts: IRunOpts = {},
+  ): Promise<ISpectralFullResult> {
+    if (this.ruleset === void 0) {
+      throw new Error('No ruleset has been defined. Have you called setRuleset()?');
+    }
+
+    this._runsInFlight++;
+    try {
+      return await this._runWithResolved(target, opts);
+    } finally {
+      this._runsInFlight--;
+      // Only the last run standing may purge: see _runsInFlight.
+      if (this._resolverCache === 'per-run' && this._runsInFlight === 0) {
+        DocumentInventory.clearCache(this._resolver);
+      }
+    }
+  }
+
+  private async _runWithResolved(
     target: IParsedResult | IDocument | Record<string, unknown> | string,
     opts: IRunOpts = {},
   ): Promise<ISpectralFullResult> {
